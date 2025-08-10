@@ -1,25 +1,46 @@
+# =========================
+# Bloco 1 — IMPORTS & SETUP
+# =========================
+
+# Stdlib
 import os
+import shutil
+import pickle
+import random
+from io import BytesIO
+from time import time
+from datetime import datetime
+from collections import Counter, defaultdict
+import logging
+import warnings
+from typing import Optional, Dict, List, Tuple, Set
+
+# Terceiros
 import requests
 import pandas as pd
 import numpy as np
-import random
-import hashlib
-import pickle
-from datetime import datetime
-import shutil
-from collections import Counter, defaultdict
 from sklearn.cluster import KMeans
 from deap import base, creator, tools, algorithms
 import tensorflow as tf
+
+# Matplotlib: backend seguro para servidor/headless (defina ANTES do pyplot)
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
+# (opcional) seaborn não é usado; mantenha descomentado só se for usar de fato
+# import seaborn as sns
+
+# Telegram
 from telegram import Update, InputFile
 from telegram.ext import Updater, CommandHandler, CallbackContext
-import logging
-from io import BytesIO
-import warnings
-from typing import Optional, Dict, List, Tuple, Set
-from time import time
+
+# Núcleo preciso (score + GRASP + diversidade)
+from apostas_engine import gerar_apostas as gerar_apostas_precisas
+from apostas_engine import Config as ApostaConfig
+
+# ================================
+# Bloco 2 — Constantes & Bootstrap
+# ================================
 
 AVISO_LEGAL = (
     "<b>AVISO LEGAL E DE PRIVACIDADE</b>\n"
@@ -47,113 +68,149 @@ MANUAL_USUARIO = (
     "O bot é uma ferramenta de análise e entretenimento. Não garante prêmios ou lucro em apostas.\n"
 )
 
-def backup_csv():
-    origem = 'lotofacil_historico.csv'
+def backup_csv() -> None:
+    """Cria um backup timestampado do CSV principal, se existir."""
+    origem = "lotofacil_historico.csv"
     if os.path.exists(origem):
         destino = f"lotofacil_historico_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        shutil.copy2(origem, destino)
-        logger.info(f"Backup automático criado: {destino}")
+        try:
+            shutil.copy2(origem, destino)
+            logger.info(f"Backup automático criado: {destino}")
+        except Exception as e:
+            logger.warning(f"Falha ao criar backup do CSV: {e}")
 
-# Configuração inicial
+# Configuração inicial de warnings e logging
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
 logging.basicConfig(
     format='{"time": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TOKEN", "").strip()  # TOKEN virá das variáveis da Railway
+# Token do Telegram via variável de ambiente (Railway/Render/etc.)
+TOKEN = os.getenv("TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("TOKEN não definido no ambiente.")
 
-# Diretório persistente no Volume da Railway
-DATA_DIR = os.getenv("DATA_DIR")  # ex.: /data
+# Diretório persistente do container (ex.: /data). Se existir, usamos como CWD.
+DATA_DIR = os.getenv("DATA_DIR")
 if DATA_DIR:
     os.makedirs(DATA_DIR, exist_ok=True)
-    # Copia arquivos iniciais para o volume se não existirem
-    for _fn in ["lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.h5"]:
+    # Copia arquivos iniciais para o volume, se ausentes
+    for _fn in ("lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.h5"):
         src = os.path.join(os.getcwd(), _fn)
         dst = os.path.join(DATA_DIR, _fn)
         if (not os.path.exists(dst)) and os.path.exists(src):
             try:
                 shutil.copy2(src, dst)
             except Exception as e:
-                print(f"Aviso: não foi possível copiar {src} -> {dst}: {e}")
-    # Muda diretório de trabalho para o volume
-    os.chdir(DATA_DIR)
+                logger.warning(f"Não foi possível copiar {src} -> {dst}: {e}")
+    # Passa a trabalhar dentro do volume
+    try:
+        os.chdir(DATA_DIR)
+    except Exception as e:
+        logger.warning(f"Falha ao trocar para DATA_DIR ({DATA_DIR}): {e}")
 
-ADMIN_USER_IDS = [5344714174]  # IDs dos administradores
+# Admins e rate-limit
+ADMIN_USER_IDS: List[int] = [5344714174]  # ajuste conforme necessário
 
-# Rate limit por usuário/comando
-rate_limit_map = {}
+_rate_limit_map: Dict[int, Dict[str, float]] = {}
 
-def rate_limit(update, comando, segundos=8):
+def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
+    """
+    Anti-spam por usuário/comando.
+    Retorna False se deve bloquear a execução (muito cedo); True caso possa prosseguir.
+    """
     user_id = update.effective_user.id
     agora = time()
-    if user_id not in rate_limit_map:
-        rate_limit_map[user_id] = {}
-    if comando in rate_limit_map[user_id]:
-        if agora - rate_limit_map[user_id][comando] < segundos:
+    user_map = _rate_limit_map.setdefault(user_id, {})
+    ultimo = user_map.get(comando, 0.0)
+    if agora - ultimo < segundos:
+        try:
             update.message.reply_text("⏳ Aguarde alguns segundos antes de usar novamente.")
-            return False
-    rate_limit_map[user_id][comando] = agora
+        except Exception:
+            pass
+        return False
+    user_map[comando] = agora
     return True
 
+# ======================================
+# Bloco 3 — SecurityManager & DataFetcher
+# ======================================
+
 class SecurityManager:
-    def __init__(self):
+    """Gerencia whitelist e permissões de administrador."""
+    def __init__(self) -> None:
         self.whitelist: Set[int] = set()
         self.admins: Set[int] = set(ADMIN_USER_IDS)
         self.load_whitelist()
+
     def load_whitelist(self, file: str = "whitelist.txt") -> None:
+        """Carrega/recupera whitelist do disco (id por linha)."""
         try:
             if os.path.exists(file):
-                with open(file, "r") as f:
-                    self.whitelist = {int(line.strip()) for line in f if line.strip().isdigit()}
+                with open(file, "r", encoding="utf-8") as f:
+                    self.whitelist = {
+                        int(line.strip())
+                        for line in f
+                        if line.strip().isdigit()
+                    }
+            else:
+                # cria arquivo vazio se não existir (idempotente)
+                open(file, "a", encoding="utf-8").close()
         except Exception as e:
-            logger.error(f"Erro ao carregar whitelist: {str(e)}")
+            logger.error(f"Erro ao carregar whitelist: {e}")
+
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admins
+
     def is_authorized(self, user_id: int) -> bool:
+        """Autorizado se estiver na whitelist ou for admin."""
         return user_id in self.whitelist or self.is_admin(user_id)
 
 class DataFetcher:
-    """Gerencia obtenção de dados com fallback e cache"""
+    """Obtém último resultado da Lotofácil com fallback entre fontes."""
     API_URLS = [
         "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil",
-        "https://api-loterias.herokuapp.com/api/v1/lotofacil"
+        "https://api-loterias.herokuapp.com/api/v1/lotofacil",
     ]
-    
+
     @staticmethod
     def fetch_data(url: str, timeout: int = 10) -> Optional[Dict]:
-        """Tenta obter dados de uma URL com tratamento de erros"""
+        """Baixa JSON de uma URL com timeout e tratamento de erros."""
         try:
-            response = requests.get(url, timeout=timeout)
-            if response.status_code == 200:
-                return response.json()
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning(f"HTTP {resp.status_code} ao acessar {url}")
         except Exception as e:
-            logger.warning(f"Falha ao acessar {url}: {str(e)}")
+            logger.warning(f"Falha ao acessar {url}: {e}")
         return None
-    
+
     @classmethod
     def get_latest_data(cls) -> Optional[Dict]:
-        """Tenta obter dados de múltiplas fontes"""
+        """Percorre as URLs até conseguir um payload válido."""
         for url in cls.API_URLS:
             data = cls.fetch_data(url)
             if data and cls.validate_data(data):
                 return data
         return None
-    
+
     @staticmethod
     def validate_data(data: Dict) -> bool:
-        """Valida estrutura dos dados recebidos"""
-        required_keys = {'numero', 'data', 'dezenas'}
-        if not all(key in data for key in required_keys):
-            return False
-        if not isinstance(data['dezenas'], list) or len(data['dezenas']) != 15:
-            return False
+        """
+        Valida estrutura básica do payload:
+        - possui chaves numero, data, dezenas
+        - dezenas é lista de 15 inteiros entre 1 e 25
+        """
         try:
-            return all(1 <= int(n) <= 25 for n in data['dezenas'])
-        except (ValueError, TypeError):
+            if not all(k in data for k in ("numero", "data", "dezenas")):
+                return False
+            dezenas = data["dezenas"]
+            if not isinstance(dezenas, list) or len(dezenas) != 15:
+                return False
+            return all(1 <= int(n) <= 25 for n in dezenas)
+        except Exception:
             return False
 
 class BotLotofacil:
@@ -168,6 +225,27 @@ class BotLotofacil:
             self.modelo = self.construir_modelo()
         else:
             logger.error("Falha ao carregar dados. Verifique sua conexão com a internet.")
+
+        # Núcleo preciso
+        self.cfg_precisa = ApostaConfig()
+        self.ultima_geracao_precisa: List[List[int]] = []
+
+        # Saúde/observabilidade do engine preciso
+        self.precise_enabled: bool = True
+        self.precise_fail_count: int = 0
+        self.precise_last_error: Optional[str] = None
+
+        # Autoteste simples no startup: se falhar, mantém enabled=False e registra motivo
+        try:
+            _ = self._teste_engine_precisa_startup()
+            self.precise_enabled = True
+            self.precise_fail_count = 0
+            self.precise_last_error = None
+            logger.info("Engine precisa OK no startup.")
+        except Exception as e:
+            self.precise_enabled = False
+            self.precise_last_error = str(e)
+            logger.warning(f"Engine precisa desativado no startup: {e}")
 
     def carregar_dados(self, atualizar: bool = False) -> Optional[pd.DataFrame]:
         """
@@ -401,40 +479,46 @@ class BotLotofacil:
         return np.array(X), np.array(y)
     
     def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
-        """Gera apostas otimizadas com múltiplas estratégias"""
         apostas = []
+        usa_modelo = hasattr(self, "modelo") and self.modelo is not None and len(self.dados) >= 10
+
         for _ in range(n_apostas):
-            # 1. Geração por modelo neural
-            aposta_modelo = self.gerar_por_modelo()
-            
-            # 2. Geração por algoritmo genético
             aposta_ga = self.gerar_por_algoritmo_genetico()
-            
-            # 3. Combinação inteligente
-            aposta_final = self.combinar_apostas(aposta_modelo, aposta_ga)
+            if usa_modelo:
+                try:
+                    aposta_modelo = self.gerar_por_modelo()
+                    aposta_final = self.combinar_apostas(aposta_modelo, aposta_ga)
+                except Exception as e:
+                    logger.warning(f"Falha em gerar_por_modelo: {e}. Usando só GA para esta aposta.")
+                    usa_modelo = False
+                    aposta_final = sorted(aposta_ga)
+            else:
+                aposta_final = sorted(aposta_ga)
             apostas.append(aposta_final)
-        
-        # Aplica fechamento matemático
+
         return self.aplicar_fechamento(apostas)
-    
+
     def gerar_por_modelo(self) -> List[int]:
-        """Gera aposta usando o modelo LSTM"""
-        ultimos_numeros = self.dados[[f'B{i}' for i in range(1,16)]].values[-10:]
-        X = np.zeros((1, 10, 25 + 5))  # 25 números + 5 features
-        
-        for i in range(10):
-            for num in ultimos_numeros[i]:
-                X[0, i, num-1] = 1
-            for j in range(1,6):
+        if not hasattr(self, "modelo") or self.modelo is None:
+            raise RuntimeError("Modelo LSTM indisponível.")
+        ult = self.dados[[f'B{i}' for i in range(1,16)]].values[-10:]
+        t = len(ult)  # pode ser < 10
+        X = np.zeros((1, 10, 25 + 5))
+
+        # Preenche só o que existe
+        for i in range(t):
+            row = ult[-t + i]  # i caminha do mais antigo ao mais recente dentro da janela disponível
+            for num in row:
+                X[0, i, num - 1] = 1
+            for j in range(1, 6):
                 col_name = f'repetidos_{j}'
                 if col_name in self.dados.columns:
-                    X[0, i, 25 + j - 1] = self.dados.iloc[-i][col_name] if i > 0 else 0
-                else:
-                    X[0, i, 25 + j - 1] = 0
-        
+                    # usa a mesma linha temporal correspondente
+                    X[0, i, 25 + j - 1] = self.dados.iloc[-t + i][col_name]
+
         pred = self.modelo.predict(X, verbose=0)[0]
-        return sorted([i+1 for i in np.argsort(pred)[-15:]])
-    
+        return sorted([i + 1 for i in np.argsort(pred)[-15:]])
+
     def gerar_por_algoritmo_genetico(self) -> List[int]:
         """Gera aposta usando algoritmo genético com restrições"""
         # Evita redefinir classes caso já existam
@@ -506,7 +590,96 @@ class BotLotofacil:
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
         
         return (score,)
-    
+
+    def gerar_aposta_precisa(self, n_apostas: int = 5, seed: Optional[int] = None) -> List[List[int]]:
+        """
+        Gera apostas usando o núcleo preciso (score + GRASP + diversidade) a partir de self.dados.
+        Mantém a última geração em self.ultima_geracao_precisa.
+        """
+        if self.dados is None or len(self.dados) == 0:
+            raise RuntimeError("Dados indisponíveis para geração precisa.")
+
+        # Histórico do mais antigo ao mais recente
+        df = self.dados
+        if 'numero' in df.columns:
+            df = df.sort_values('numero').reset_index(drop=True)
+        elif 'data' in df.columns:
+            df = df.sort_values('data').reset_index(drop=True)
+        else:
+            df = df.reset_index(drop=True)
+
+        historico: List[List[int]] = []
+        for _, row in df.iterrows():
+            historico.append([int(row[f'B{i}']) for i in range(1, 16)])
+
+        # Seed reprodutível: próximo concurso
+        if seed is None:
+            try:
+                seed = int(df['numero'].max()) + 1
+            except Exception:
+                seed = len(df) + 1
+
+        n_apostas = max(1, min(int(n_apostas), 10))
+        apostas = gerar_apostas_precisas(historico, quantidade=n_apostas, seed=seed, cfg=self.cfg_precisa)
+        self.ultima_geracao_precisa = [list(map(int, ap)) for ap in apostas]
+        return self.ultima_geracao_precisa
+ 
+    def _precheck_precisa(self) -> None:
+        """Valida pré-condições para o engine preciso."""
+        if self.dados is None or len(self.dados) < 30:
+            raise RuntimeError("Histórico insuficiente para geração precisa (mínimo 30 concursos).")
+        for col in [f'B{i}' for i in range(1,16)]:
+            if col not in self.dados.columns:
+                raise RuntimeError(f"Coluna obrigatória ausente no histórico: {col}")
+
+    def _teste_engine_precisa_startup(self) -> bool:
+        """Tenta gerar 1 aposta para verificar saúde no start."""
+        self._precheck_precisa()
+        _ = self.gerar_aposta_precisa(n_apostas=1, seed=None)
+        return True
+
+    def gerar_aposta_precisa_com_retry(self, n_apostas: int, seed: Optional[int] = None, retries: int = 2) -> List[List[int]]:
+        """Wrapper resiliente com retries e contadores de falha."""
+        last_exc: Optional[Exception] = None
+        self._precheck_precisa()
+        for tent in range(retries + 1):
+            try:
+                resultado = self.gerar_aposta_precisa(n_apostas=n_apostas, seed=seed)
+                # sucesso: zera contador
+                self.precise_fail_count = 0
+                self.precise_enabled = True
+                self.precise_last_error = None
+                return resultado
+            except Exception as e:
+                last_exc = e
+                self.precise_fail_count += 1
+                self.precise_last_error = str(e)
+                # pequeno backoff simples
+                try:
+                    import time as _t
+                    _t.sleep(0.2 * (tent + 1))
+                except Exception:
+                    pass
+
+        # se chegou aqui, esgotou retries: marca como degradado
+        self.precise_enabled = False
+        # opcional: alerta admin se houver muitas falhas seguidas
+        if self.precise_fail_count >= 3:
+            try:
+                for _admin in ADMIN_USER_IDS:
+                    self._notificar_admin_falha_precisa(_admin)
+            except Exception:
+                pass
+        # levanta a última exceção para o caller aplicar fallback
+        raise last_exc or RuntimeError("Falha desconhecida no engine precisa.")
+
+    def _notificar_admin_falha_precisa(self, admin_id: int) -> None:
+        """Mensagem simples de alerta ao admin (best-effort)."""
+        try:
+            logger.warning(f"[ADMIN ALERT] Falhas seguidas no engine precisa: {self.precise_fail_count} | Último erro: {self.precise_last_error}")
+        except Exception:
+            pass
+
     def combinar_apostas(self, aposta1: List[int], aposta2: List[int]) -> List[int]:
         """Combina duas apostas de forma inteligente"""
         comuns = set(aposta1) & set(aposta2)
@@ -517,26 +690,29 @@ class BotLotofacil:
         return sorted(nova_aposta)
     
     def aplicar_fechamento(self, apostas: List[List[int]]) -> List[List[int]]:
-        """Aplica sistema de fechamento para cobertura de números"""
-        todos_numeros = list(range(1, 26))
+        todos_numeros = set(range(1, 26))
         cobertura = Counter()
-        
-        # Prioriza números menos sorteados nas apostas
-        for aposta in apostas:
-            cobertura.update(aposta)
-        
-        # Garante que todos números tenham chance
-        for num in todos_numeros:
-            if cobertura[num] == 0:
-                # Substitui o número menos útil em uma das apostas
-                aposta_menor_score = min(apostas, key=lambda a: sum(self.frequencias[n] for n in a))
-                substituto = random.choice([n for n in aposta_menor_score if cobertura[n] > 1])
-                aposta_menor_score.remove(substituto)
-                aposta_menor_score.append(num)
-                aposta_menor_score.sort()
-                cobertura[substituto] -= 1
-                cobertura[num] += 1
-        
+        for ap in apostas:
+            cobertura.update(ap)
+
+        faltantes = [n for n in todos_numeros if cobertura[n] == 0]
+        if not faltantes:
+            return apostas
+
+        for num in faltantes:
+            aposta_menor_score = min(apostas, key=lambda a: sum(self.frequencias[n] for n in a))
+            candidatos = [n for n in aposta_menor_score if cobertura[n] > 1]
+            if not candidatos:
+                # se não há redundância, troca qualquer um (para garantir cobertura global)
+                candidatos = list(aposta_menor_score)
+
+            substituto = random.choice(candidatos)
+            aposta_menor_score.remove(substituto)
+            aposta_menor_score.append(num)
+            aposta_menor_score.sort()
+            cobertura[substituto] -= 1
+            cobertura[num] += 1
+
         return apostas
     
     def verificar_clusters(self, aposta: List[int]) -> Dict[int, int]:
@@ -642,8 +818,16 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
     try:
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
         n_apostas = max(1, min(n_apostas, 10))
-        apostas = bot.gerar_aposta(n_apostas)
-        mensagem = "🎲 Apostas recomendadas 🎲\n\n"
+
+        engine_label = "precisa"
+        try:
+            apostas = bot.gerar_aposta_precisa_com_retry(n_apostas=n_apostas, seed=None, retries=2)
+        except Exception as e_precisa:
+            logger.warning(f"Falha no gerador preciso (com retry). Usando fallback clássico. Detalhe: {e_precisa}")
+            apostas = bot.gerar_aposta(n_apostas)
+            engine_label = "clássico (fallback)"
+
+        mensagem = f"🎲 Apostas recomendadas — engine: {engine_label} 🎲\n\n"
         for i, aposta in enumerate(apostas, 1):
             pares = sum(1 for n in aposta if n % 2 == 0)
             soma = sum(aposta)
@@ -719,9 +903,26 @@ def comando_atualizar(update: Update, context: CallbackContext) -> None:
             update.message.reply_text("❌ Falha ao atualizar dados. Nenhum dado foi carregado.")
             logger.error("Falha ao atualizar dados: Nenhum dado foi carregado.")
             return
+
         bot.analisar_dados()
         bot.modelo = bot.construir_modelo()
-        update.message.reply_text("✅ Dados e modelo atualizados com sucesso!")
+
+        # Revalida engine precisa após atualizar os dados/modelo
+        try:
+            bot._teste_engine_precisa_startup()
+            bot.precise_enabled = True
+            bot.precise_fail_count = 0
+            bot.precise_last_error = None
+            update.message.reply_text("✅ Dados e modelo atualizados com sucesso! Engine precisa revalidado e ATIVO.")
+        except Exception as e:
+            bot.precise_enabled = False
+            bot.precise_last_error = str(e)
+            update.message.reply_text(
+                "✅ Dados e modelo atualizados.\n"
+                f"⚠️ Engine precisa desativado após reteste: {e}"
+            )
+            logger.warning(f"Engine precisa desativado após atualizar: {e}")
+
     except Exception as e:
         logger.error(f"Erro ao atualizar dados: {str(e)}")
         update.message.reply_text("❌ Falha ao atualizar dados. Verifique os logs.")
@@ -736,14 +937,25 @@ def comando_status(update: Update, context: CallbackContext) -> None:
         return
     try:
         ultimo = bot.dados.loc[bot.dados['data'].idxmax()]
+        precise_state = "✅ Ativo" if getattr(bot, "precise_enabled", False) else "❌ Desativado"
+        precise_fail = getattr(bot, "precise_fail_count", 0)
+        precise_err  = getattr(bot, "precise_last_error", None)
+
         status = (
             "<b>📊 Status do Sistema</b>\n\n"
             f"<b>Concursos carregados:</b> {len(bot.dados)}\n"
             f"<b>Último concurso:</b> {ultimo['numero']} ({ultimo['data'].strftime('%d/%m/%Y')})\n"
             f"<b>Modelo IA:</b> {'Carregado' if hasattr(bot, 'modelo') and bot.modelo is not None else 'Não treinado'}\n"
-            f"<b>Números mais quentes:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common(3))}\n"
+            f"<b>Engine precisa:</b> {precise_state} | Falhas recentes: {precise_fail}\n"
+        )
+        if precise_err:
+            status += f"<b>Último erro:</b> {precise_err[:200]}{'...' if len(precise_err) > 200 else ''}\n"
+
+        status += (
+            f"\n<b>Números mais quentes:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common(3))}\n"
             f"<b>Números mais frios:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common()[-3:])}"
         )
+
         update.message.reply_text(status, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Erro ao verificar status: {str(e)}")
@@ -772,18 +984,90 @@ def comando_inserir(update, context):
         except Exception:
             update.message.reply_text("❌ Data inválida. Utilize o formato YYYY-MM-DD.")
             return
+
+        # ------------------------------------------------------------------
+        # ⚠️ SUGESTÃO (opcional): validar duplicidade de data antes de inserir
+        # Não remove nada do fluxo original; apenas evita inserir se já existir.
+        try:
+            data_dt = pd.to_datetime(data, format="%Y-%m-%d", errors="raise")
+        except Exception:
+            update.message.reply_text("❌ Data inválida ao normalizar. Utilize o formato YYYY-MM-DD.")
+            return
+        # ------------------------------------------------------------------
+
         arq = 'lotofacil_historico.csv'
         if not os.path.exists(arq):
             update.message.reply_text("❌ Arquivo lotofacil_historico.csv não encontrado no servidor.")
             return
         df = pd.read_csv(arq)
-        proximo_numero = int(df['numero'].max()) + 1 if 'numero' in df.columns else len(df) + 1
+
+        # ------------------------------------------------------------------
+        # ⚠️ SUGESTÃO (opcional): checar se já existe concurso com a MESMA data
+        try:
+            if 'data' in df.columns and not df.empty:
+                df_datas = pd.to_datetime(df['data'], format="%Y-%m-%d", errors="coerce")
+                if df_datas.isna().any():
+                    alt = pd.to_datetime(df['data'], dayfirst=True, errors="coerce")
+                    df_datas = df_datas.fillna(alt)
+                if (df_datas.dt.date == data_dt.date()).any():
+                    update.message.reply_text(
+                        "⚠️ Já existe um concurso com esta data no histórico.\n"
+                        "Para evitar duplicidade, a inserção foi cancelada.\n"
+                        "Se for realmente um novo registro da mesma data, ajuste a data ou edite o CSV manualmente."
+                    )
+                    return
+        except Exception:
+            # Se algo der errado, não bloqueia a operação; apenas segue.
+            pass
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        # ✅ (opcional) Bloquear inserção se as 15 dezenas já existirem em algum concurso
+        try:
+            if not df.empty:
+                alvo = frozenset(int(x) for x in dezenas_int)
+                # percorre apenas colunas B1..B15 se existirem
+                cols_b = [f'B{i}' for i in range(1, 16) if f'B{i}' in df.columns]
+                if len(cols_b) == 15:
+                    repetida = False
+                    for _, row in df[cols_b].iterrows():
+                        try:
+                            s = frozenset(int(row[f'B{i}']) for i in range(1, 16))
+                            if s == alvo:
+                                repetida = True
+                                break
+                        except Exception:
+                            # se alguma linha estiver suja, ignora e continua
+                            continue
+                    if repetida:
+                        update.message.reply_text(
+                            "⚠️ Já existe um concurso com exatamente as mesmas 15 dezenas.\n"
+                            "A inserção foi cancelada para evitar duplicidade de combinação."
+                        )
+                        return
+        except Exception:
+            # Qualquer falha aqui não impede a inserção; é check opcional.
+            pass
+        # ------------------------------------------------------------------
+
+        # Próximo número seguro mesmo com CSV vazio ou 'numero' nulo
+        if 'numero' in df.columns and not df['numero'].dropna().empty:
+            try:
+                max_num = pd.to_numeric(df['numero'], errors='coerce').max()
+                proximo_numero = int(max_num) + 1 if pd.notna(max_num) else len(df) + 1
+            except Exception:
+                proximo_numero = len(df) + 1
+        else:
+            proximo_numero = len(df) + 1
+
         nova_linha = {'numero': proximo_numero, 'data': data}
         for i, dez in enumerate(dezenas_int, 1):
             nova_linha[f'B{i}'] = dez
         for i in range(1, 6):
             nova_linha[f'repetidos_{i}'] = 0
+
         df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+
         # Recalcula campos de repetidos corretamente
         for rep in range(1, 6):
             repetidos = []
@@ -791,13 +1075,15 @@ def comando_inserir(update, context):
                 if idx < rep:
                     repetidos.append(0)
                 else:
-                    nums_atual = set([row[f'B{i}'] for i in range(1, 16)])
-                    nums_anterior = set([df.iloc[idx - rep][f'B{i}'] for i in range(1, 16)])
+                    nums_atual = set([row.get(f'B{i}', 0) for i in range(1, 16)])
+                    nums_anterior = set([df.iloc[idx - rep].get(f'B{i}', 0) for i in range(1, 16)])
                     repetidos.append(len(nums_atual & nums_anterior))
             df[f'repetidos_{rep}'] = repetidos
+
         df = df.sort_values('numero').reset_index(drop=True)
         backup_csv()  # Faz backup automático antes de salvar o CSV final
         df.to_csv(arq, index=False, encoding='utf-8')
+
         update.message.reply_text(
             f"✅ Resultado inserido com sucesso!\nConcurso: {proximo_numero}\nData: {data}\nDezenas: {' '.join(str(d).zfill(2) for d in dezenas_int)}"
         )
@@ -814,12 +1100,6 @@ def comando_meuid(update: Update, context: CallbackContext) -> None:
         "Envie este número para o administrador do bot para solicitar acesso.",
         parse_mode='HTML'
     )
-
-def error_handler(update: Update, context: CallbackContext) -> None:
-    """Handler para erros não tratados"""
-    logger.error(f"Erro no bot: {str(context.error)}")
-    if update and update.message:
-        update.message.reply_text("❌ Ocorreu um erro inesperado. Os administradores foram notificados.")
 
 @apenas_admin
 def comando_autorizar(update: Update, context: CallbackContext) -> None:
@@ -902,4 +1182,5 @@ def main() -> None:
         logger.error(f"Erro fatal ao iniciar o bot: {str(e)}")
 
 if __name__ == "__main__":
+
     main()
