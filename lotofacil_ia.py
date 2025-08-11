@@ -716,7 +716,7 @@ class BotLotofacil:
     
     def avaliar_aposta_ga(self, aposta: List[int]) -> Tuple[float]:
         """Função de fitness para o algoritmo genético (penalidades aditivas + mitigação de viés)."""
-        # Normaliza e valida
+        # Normaliza e valida a aposta
         aposta = list(set(aposta))
         if len(aposta) != 15:
             return (0.0,)
@@ -730,9 +730,9 @@ class BotLotofacil:
         for i in aposta:
             for j in aposta:
                 if i != j:
-                  score += self.coocorrencias[i-1, j-1] * 0.1
+                    score += self.coocorrencias[i-1, j-1] * 0.1
 
-        # 3) Bônus por clusters (2–4 números por cluster)
+        # 3) Bônus por clusters (2–4 números por cluster) — incentivo suave
         for cluster in self.clusters.values():
             intersect = set(aposta) & set(cluster)
             if 2 <= len(intersect) <= 4:
@@ -752,12 +752,11 @@ class BotLotofacil:
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
 
         # 6) Mitigação de viés estrutural (leve)
-        # 6.1) Trio 01-02-03 completo
+        # 6.1) Penaliza presença fixa do trio 01-02-03
         if {1, 2, 3}.issubset(set(aposta)):
             score -= 6.0  # penalização leve para evitar repetição constante
-
-        # 6.2) Sequências longas de consecutivos
-        run_len = self._maior_sequencia_consecutivos(aposta)  # requer o helper definido na classe
+        # 6.2) Penaliza sequências longas de consecutivos
+        run_len = self._maior_sequencia_consecutivos(aposta)
         if run_len >= 4:
             score -= (run_len - 3) * 4.0  # 4 -> -4, 5 -> -8, etc. (leve a moderado)
 
@@ -1439,6 +1438,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
