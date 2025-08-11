@@ -8,7 +8,6 @@ import shutil
 import pickle
 import random
 from io import BytesIO
-from time import time
 from datetime import datetime
 from collections import Counter, defaultdict
 import logging
@@ -169,7 +168,7 @@ def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
     Retorna False se deve bloquear a execução (muito cedo); True caso possa prosseguir.
     """
     user_id = update.effective_user.id
-    agora = time()
+    agora = _now()  # <- usa o alias único
     user_map = _rate_limit_map.setdefault(user_id, {})
     ultimo = user_map.get(comando, 0.0)
     if agora - ultimo < segundos:
@@ -423,31 +422,34 @@ class BotLotofacil:
         return sequencias
     
     def identificar_clusters(self) -> Dict[int, List[int]]:
-        """Identifica clusters dinâmicos com cache"""
+        """Identifica clusters dinâmicos com cache (sem warnings de feature names)."""
         cache_file = os.path.join(self.cache_dir, "clusters_cache.pkl")
-        
+
         try:
             if os.path.exists(cache_file):
                 with open(cache_file, 'rb') as f:
                     return pickle.load(f)
         except Exception as e:
             logger.warning(f"Cache de clusters corrompido. Recriando... Erro: {str(e)}")
-        
-        dados_cluster = self.dados[[f'B{i}' for i in range(1,16)]]
+
+        # Treina com DataFrame e também PREDIZ com DataFrame (mesmas colunas) para evitar warnings
+        dados_cluster = self.dados[[f'B{i}' for i in range(1, 16)]]
         kmeans = KMeans(n_clusters=4, random_state=42).fit(dados_cluster)
-        clusters = {i: [] for i in range(4)}
+
+        clusters: Dict[int, List[int]] = {i: [] for i in range(4)}
         for num in range(1, 26):
-            cluster = kmeans.predict([[num]*15])[0]
+            sample = pd.DataFrame([[num] * 15], columns=dados_cluster.columns)  # mantém nomes de features
+            cluster = kmeans.predict(sample)[0]
             clusters[cluster].append(num)
-        
+
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump(clusters, f)
         except Exception as e:
             logger.error(f"Falha ao salvar cache de clusters: {str(e)}")
-        
+
         return clusters
-    
+
     def construir_modelo(self) -> Optional[tf.keras.Model]:
         """Constroi modelo LSTM avançado com otimizações (validação temporal)."""
         if os.path.exists(self.modelo_path):
@@ -752,15 +754,13 @@ class BotLotofacil:
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
 
         # 6) Mitigação de viés estrutural (leve)
-        # 6.1) Penaliza presença fixa do trio 01-02-03
         if {1, 2, 3}.issubset(set(aposta)):
-            score -= 6.0  # penalização leve para evitar repetição constante
-        # 6.2) Penaliza sequências longas de consecutivos
+            score -= 6.0
         run_len = self._maior_sequencia_consecutivos(aposta)
         if run_len >= 4:
-            score -= (run_len - 3) * 4.0  # 4 -> -4, 5 -> -8, etc. (leve a moderado)
+            score -= (run_len - 3) * 4.0
 
-        # 7) Aplica penalidade agregada no final
+        # 7) Penalidade agregada no final
         score -= penalty
         return (score,)
 
@@ -1438,6 +1438,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
