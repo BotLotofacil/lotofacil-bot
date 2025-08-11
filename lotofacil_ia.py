@@ -500,6 +500,69 @@ class BotLotofacil:
             y.append(target)
         
         return np.array(X), np.array(y)
+
+    def _mutacao_suave(
+        self,
+        aposta: List[int],
+        rng: random.Random,
+        cobertura_execucao: Counter,
+        max_trocas: int = 2,
+        tol_score: float = 3.0,
+        p_aplicar: float = 0.5,
+    ) -> List[int]:
+        """
+        Faz 0–2 trocas leves para aumentar diversidade.
+        Regras:
+          - mantém 15 números únicos
+          - mantém pares em [5,10] e soma em [160,220]
+          - aceita se score não cair além de tol_score
+        """
+        if rng.random() > p_aplicar:
+            return aposta[:]
+
+        base = aposta[:]
+        score_orig = self.avaliar_aposta_ga(base)[0]
+
+        pressao_remover = {n: self.frequencias.get(n, 0) + cobertura_execucao[n] for n in base}
+        candidatos_remover = sorted(base, key=lambda n: (-pressao_remover[n], n))
+
+        fora = [n for n in range(1, 26) if n not in base]
+        vantagem_incluir = {
+            n: -self.frequencias.get(n, 0)
+               + float(np.sum(self.coocorrencias[n-1, [x-1 for x in base]])) * 0.05
+            for n in fora
+        }
+        candidatos_incluir = sorted(fora, key=lambda n: (vantagem_incluir[n], n), reverse=True)
+
+        tentativa = base[:]
+        trocas = 0
+        idx_rem = 0
+        idx_inc = 0
+
+        while trocas < max_trocas and idx_rem < len(candidatos_remover) and idx_inc < len(candidatos_incluir):
+            sai = candidatos_remover[idx_rem]; idx_rem += 1
+            entra = candidatos_incluir[idx_inc]; idx_inc += 1
+
+            if entra in tentativa:
+                continue
+
+            nova = [x for x in tentativa if x != sai] + [entra]
+            nova.sort()
+
+            pares = sum(1 for n in nova if n % 2 == 0)
+            soma = sum(nova)
+            if not (5 <= pares <= 10):
+                continue
+            if not (160 <= soma <= 220):
+                continue
+
+            score_novo = self.avaliar_aposta_ga(nova)[0]
+            if score_novo + tol_score >= score_orig:
+                tentativa = nova
+                score_orig = score_novo
+                trocas += 1
+
+        return tentativa
     
     def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
         apostas = []
@@ -647,44 +710,52 @@ class BotLotofacil:
         n_alvo = max(1, min(int(n_apostas), 10))
         apostas_final: List[List[int]] = []
         vistos: Set[Tuple[int, ...]] = set()
+        cobertura_execucao = Counter()  # cobertura dentro desta execução
 
-        # Tenta gerar 1 por vez variando a seed; se repetir, faz retentativas limitadas
         for i in range(n_alvo):
+            rng = random.Random(seed + i*7919 if seed is not None else None)
+
             obtida: Optional[List[int]] = None
-            for tentativa in range(8):  # até 8 retentativas para fugir de duplicatas
-                seed_i = seed + (i * 997) + (tentativa * 37)  # offsets coprimos para espalhar
+            for tentativa in range(8):
+                seed_i = (seed or 0) + (i * 997) + (tentativa * 37)
                 try:
                     geradas = gerar_apostas_precisas(
-                        historico,
-                        quantidade=1,
-                        seed=seed_i,
-                        cfg=self.cfg_precisa
+                        historico, quantidade=1, seed=seed_i, cfg=self.cfg_precisa
                     )
                 except Exception:
-                    # tenta próxima seed nesta posição
                     continue
 
                 if not geradas:
                     continue
 
                 ap = sorted(map(int, geradas[0]))
-                chave = tuple(ap)
-                if chave not in vistos:
+                if tuple(ap) not in vistos:
                     obtida = ap
-                    break  # ok, aceita esta aposta
+                    break
 
             if obtida is None:
-                # fallback: usa GA para garantir diversidade
                 try:
                     obtida = sorted(self.gerar_por_algoritmo_genetico())
                 except Exception:
                     obtida = apostas_final[0] if apostas_final else [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
 
+            # >>> AQUI: micro-variabilidade aleatória controlada <<<
+            obtida = self._mutacao_suave(
+                aposta=obtida,
+                rng=rng,
+                cobertura_execucao=cobertura_execucao,
+                max_trocas=2,
+                tol_score=3.0,
+                p_aplicar=0.5,
+            )
+            # <<< fim mutação >>>
+
             apostas_final.append(obtida)
             vistos.add(tuple(obtida))
-
-         self.ultima_geracao_precisa = apostas_final
-         return self.ultima_geracao_precisa
+            cobertura_execucao.update(obtida)
+        
+        self.ultima_geracao_precisa = apostas_final
+        return self.ultima_geracao_precisa
 
     def _precheck_precisa(self) -> None:
         """Valida pré-condições para o engine preciso."""
@@ -1246,6 +1317,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
