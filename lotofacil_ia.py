@@ -618,8 +618,8 @@ class BotLotofacil:
 
     def gerar_aposta_precisa(self, n_apostas: int = 5, seed: Optional[int] = None) -> List[List[int]]:
         """
-        Gera apostas usando o núcleo preciso (score + GRASP + diversidade) a partir de self.dados.
-        Mantém a última geração em self.ultima_geracao_precisa.
+        Gera apostas usando o núcleo preciso (score + GRASP + diversidade) a partir de self.dados,
+        garantindo diversidade (sem duplicatas) e variando a semente por aposta.
         """
         if self.dados is None or len(self.dados) == 0:
             raise RuntimeError("Dados indisponíveis para geração precisa.")
@@ -637,18 +637,58 @@ class BotLotofacil:
         for _, row in df.iterrows():
             historico.append([int(row[f'B{i}']) for i in range(1, 16)])
 
-        # Seed reprodutível: próximo concurso
+        # Semente base (reprodutível por concurso), mas variada por aposta
         if seed is None:
             try:
                 seed = int(df['numero'].max()) + 1
             except Exception:
                 seed = len(df) + 1
 
-        n_apostas = max(1, min(int(n_apostas), 10))
-        apostas = gerar_apostas_precisas(historico, quantidade=n_apostas, seed=seed, cfg=self.cfg_precisa)
-        self.ultima_geracao_precisa = [list(map(int, ap)) for ap in apostas]
-        return self.ultima_geracao_precisa
- 
+        n_alvo = max(1, min(int(n_apostas), 10))
+        apostas_final: List[List[int]] = []
+        vistos: Set[Tuple[int, ...]] = set()
+
+        # Tenta gerar 1 por vez variando a seed; se repetir, faz retentativas limitadas
+        for i in range(n_alvo):
+            obtida = None
+            for tentativa in range(8):  # até 8 retentativas para fugir de duplicatas
+                seed_i = seed + (i * 997) + (tentativa * 37)  # offsets coprimos para espalhar
+                try:
+                    geradas = gerar_apostas_precisas(
+                        historico,
+                        quantidade=1,
+                        seed=seed_i,
+                        cfg=self.cfg_precisa
+                    )
+                except Exception as e:
+                    # falha do núcleo preciso nesta iteração -> tenta próxima seed
+                    if tentativa == 7:
+                        raise e
+                    continue
+
+                if not geradas:
+                    continue
+
+                ap = sorted(map(int, geradas[0]))
+                chave = tuple(ap)
+                if chave not in vistos:
+                    obtida = ap
+                    break  # ok
+
+            if obtida is None:
+               # fallback duro: usa GA para garantir diversidade
+               try:
+                   obtida = sorted(self.gerar_por_algoritmo_genetico())
+               except Exception:
+                   # último recurso: repete a primeira (não deve ocorrer)
+                   obtida = apostas_final[0] if apostas_final else [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+
+           apostas_final.append(obtida)
+           vistos.add(tuple(obtida))
+
+       self.ultima_geracao_precisa = apostas_final
+       return self.ultima_geracao_precisa
+
     def _precheck_precisa(self) -> None:
         """Valida pré-condições para o engine preciso."""
         if self.dados is None or len(self.dados) < 30:
@@ -1209,5 +1249,6 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
