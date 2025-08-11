@@ -38,6 +38,53 @@ from telegram.ext import Updater, CommandHandler, CallbackContext
 from apostas_engine import gerar_apostas as gerar_apostas_precisas
 from apostas_engine import Config as ApostaConfig
 
+# ==== Barra de carregamento para /aposta (JobQueue) ====
+from time import time as _now
+
+_PROGRESS_FRAMES = ["▁","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃"]
+
+def _progress_tick(context):
+    data = context.job.context
+    msg = data.get("msg")
+    i = data.get("i", 0)
+    t0 = data.get("t0", _now())
+    frame = _PROGRESS_FRAMES[i % len(_PROGRESS_FRAMES)]
+    elapsed = int(_now() - t0)
+    try:
+        # Indeterminada: repetimos o mesmo char para parecer “barra”
+        bar = frame * 20
+        msg.edit_text(
+            f"⏳ <b>Gerando apostas...</b>\n{bar}\n<i>{elapsed}s</i>",
+            parse_mode='HTML'
+        )
+    except Exception:
+        # ignora erros de edição (mensagem apagada, etc.)
+        pass
+    data["i"] = i + 1
+
+def _start_progress(context, chat_id):
+    """Cria a mensagem e agenda atualizações periódicas."""
+    msg = context.bot.send_message(chat_id, "⏳ Iniciando geração...", parse_mode='HTML')
+    job = context.job_queue.run_repeating(
+        _progress_tick,
+        interval=0.7,           # atualiza a cada ~700ms
+        first=0.0,
+        context={"msg": msg, "i": 0, "t0": _now()}
+    )
+    return msg, job
+
+def _stop_progress(job, msg, final_text):
+    """Para as atualizações e finaliza a mensagem de progresso."""
+    try:
+        job.schedule_removal()
+    except Exception:
+        pass
+    try:
+        msg.edit_text(final_text, parse_mode='HTML')
+    except Exception:
+        pass
+# ==== fim helpers ====
+
 # ================================
 # Bloco 2 — Constantes & Bootstrap
 # ================================
@@ -563,7 +610,35 @@ class BotLotofacil:
                 trocas += 1
 
         return tentativa
-    
+
+    def _maior_sequencia_consecutivos(self, aposta: List[int]) -> int:
+        """Retorna o tamanho da maior sequência de consecutivos na aposta."""
+        if not aposta:
+            return 0
+        nums = sorted(aposta)
+        best = cur = 1
+        for i in range(1, len(nums)):
+            if nums[i] == nums[i-1] + 1:
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 1
+        return best
+
+    def _tem_prefixo_123(self, aposta: List[int]) -> bool:
+        """True se {1,2,3} estiver inteiro na aposta."""
+        s = set(aposta)
+        return {1,2,3}.issubset(s)
+
+    def _diferenca_minima(self, ap: List[int], existentes: List[List[int]], min_diff: int = 4) -> bool:
+        """Garante que a aposta difere de TODAS as já geradas por pelo menos min_diff dezenas."""
+        s = set(ap)
+        for e in existentes:
+            comum = len(s & set(e))
+            if 15 - comum < min_diff:
+                return False
+        return True
+
     def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
         apostas = []
         usa_modelo = hasattr(self, "modelo") and self.modelo is not None and len(self.dados) >= 10
@@ -640,29 +715,30 @@ class BotLotofacil:
         return aposta_final
     
     def avaliar_aposta_ga(self, aposta: List[int]) -> Tuple[float]:
-        """Função de fitness para o algoritmo genético (penalidades aditivas)."""
+        """Função de fitness para o algoritmo genético (penalidades aditivas + mitigação de viés)."""
+        # Normaliza e valida
         aposta = list(set(aposta))
         if len(aposta) != 15:
             return (0.0,)
 
         score = 0.0
 
-        # Pontua por frequência histórica
+        # 1) Pontuação por frequência histórica
         score += sum(self.frequencias[n] for n in aposta)
 
-        # Pontua por coocorrência
+        # 2) Pontuação por coocorrência (pares ordenados i != j)
         for i in aposta:
             for j in aposta:
                 if i != j:
-                    score += self.coocorrencias[i-1, j-1] * 0.1
+                  score += self.coocorrencias[i-1, j-1] * 0.1
 
-        # Pontua por clusters (2–4 números por cluster) – bônus suave
+        # 3) Bônus por clusters (2–4 números por cluster)
         for cluster in self.clusters.values():
             intersect = set(aposta) & set(cluster)
             if 2 <= len(intersect) <= 4:
                 score += 10.0
 
-        # Penalidades apenas aditivas (faixas mais amplas para reduzir viés)
+        # 4) Penalidades aditivas (faixas amplas para reduzir viés global)
         pares = sum(1 for n in aposta if n % 2 == 0)
         soma = sum(aposta)
         penalty = 0.0
@@ -671,11 +747,21 @@ class BotLotofacil:
         if not (160 <= soma <= 220):
             penalty += 10.0
 
-        # Reforço por sequência inicial comum
+        # 5) Reforço por sequência inicial comum (padrão histórico)
         seq_inicial = tuple(sorted(aposta)[:3])
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
 
-        # Aplica penalidade no final (tudo aditivo)
+        # 6) Mitigação de viés estrutural (leve)
+        # 6.1) Trio 01-02-03 completo
+        if {1, 2, 3}.issubset(set(aposta)):
+            score -= 6.0  # penalização leve para evitar repetição constante
+
+        # 6.2) Sequências longas de consecutivos
+        run_len = self._maior_sequencia_consecutivos(aposta)  # requer o helper definido na classe
+        if run_len >= 4:
+            score -= (run_len - 3) * 4.0  # 4 -> -4, 5 -> -8, etc. (leve a moderado)
+
+        # 7) Aplica penalidade agregada no final
         score -= penalty
         return (score,)
 
@@ -739,7 +825,8 @@ class BotLotofacil:
                 except Exception:
                     obtida = apostas_final[0] if apostas_final else [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
 
-            # >>> AQUI: micro-variabilidade aleatória controlada <<<
+            # >>> mitigação de viés + micro-variabilidade controlada <<<
+            # 3.1) aplica mutação suave padrão
             obtida = self._mutacao_suave(
                 aposta=obtida,
                 rng=rng,
@@ -748,12 +835,31 @@ class BotLotofacil:
                 tol_score=3.0,
                 p_aplicar=0.5,
             )
-            # <<< fim mutação >>>
+
+            # 3.2) se detectar viés (prefixo 1-2-3, sequência longa) ou baixa diversidade no lote,
+            #     força 1-2 mutações adicionais com p=1.0 e max_trocas maiores
+            needs_break = self._tem_prefixo_123(obtida) or self._maior_sequencia_consecutivos(obtida) >= 4 \
+                          or not self._diferenca_minima(obtida, apostas_final, min_diff=4)
+            if needs_break:
+                for _ in range(2):  # até 2 tentativas extra para quebrar padrão
+                    obtida = self._mutacao_suave(
+                        aposta=obtida,
+                        rng=rng,
+                        cobertura_execucao=cobertura_execucao,
+                        max_trocas=3,
+                        tol_score=4.0,
+                        p_aplicar=1.0,  # força tentar
+                    )
+                    if self._maior_sequencia_consecutivos(obtida) < 4 and \
+                       not self._tem_prefixo_123(obtida) and \
+                       self._diferenca_minima(obtida, apostas_final, min_diff=4):
+                        break
+            # <<< fim mitigação >>>
 
             apostas_final.append(obtida)
             vistos.add(tuple(obtida))
             cobertura_execucao.update(obtida)
-        
+    
         self.ultima_geracao_precisa = apostas_final
         return self.ultima_geracao_precisa
 
@@ -948,7 +1054,14 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
         logger.error("Dados indisponíveis ao tentar gerar apostas.")
         return
+
+    progress_msg = None
+    progress_job = None
     try:
+        # --- INICIA A BARRA ---
+        chat_id = update.effective_chat.id
+        progress_msg, progress_job = _start_progress(context, chat_id)
+
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
         n_apostas = max(1, min(n_apostas, 10))
 
@@ -960,6 +1073,11 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
             apostas = bot.gerar_aposta(n_apostas)
             engine_label = "clássico (fallback)"
 
+        # --- PARA A BARRA COM SUCESSO ---
+        if progress_job and progress_msg:
+            _stop_progress(progress_job, progress_msg, "✅ <b>Geração concluída.</b>")
+
+        # Envia o resultado
         mensagem = f"🎲 Apostas recomendadas — engine: {engine_label} 🎲\n\n"
         for i, aposta in enumerate(apostas, 1):
             pares = sum(1 for n in aposta if n % 2 == 0)
@@ -969,8 +1087,12 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
                 f"Pares: {pares} | Ímpares: {15-pares} | Soma: {soma}\n\n"
             )
         update.message.reply_text(mensagem, parse_mode='HTML')
+
     except Exception as e:
         logger.error(f"Erro ao gerar apostas: {str(e)}")
+        # --- PARA A BARRA COM ERRO ---
+        if progress_job and progress_msg:
+            _stop_progress(progress_job, progress_msg, "❌ <b>Falha na geração.</b>")
         update.message.reply_text("❌ Ocorreu um erro ao gerar as apostas. Tente novamente.")
 
 @somente_autorizado
@@ -1317,6 +1439,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
