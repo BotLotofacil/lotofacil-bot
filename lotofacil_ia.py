@@ -650,7 +650,7 @@ class BotLotofacil:
 
         # Tenta gerar 1 por vez variando a seed; se repetir, faz retentativas limitadas
         for i in range(n_alvo):
-            obtida = None
+            obtida: Optional[List[int]] = None
             for tentativa in range(8):  # até 8 retentativas para fugir de duplicatas
                 seed_i = seed + (i * 997) + (tentativa * 37)  # offsets coprimos para espalhar
                 try:
@@ -660,10 +660,8 @@ class BotLotofacil:
                         seed=seed_i,
                         cfg=self.cfg_precisa
                     )
-                except Exception as e:
-                    # falha do núcleo preciso nesta iteração -> tenta próxima seed
-                    if tentativa == 7:
-                        raise e
+                except Exception:
+                    # tenta próxima seed nesta posição
                     continue
 
                 if not geradas:
@@ -673,21 +671,20 @@ class BotLotofacil:
                 chave = tuple(ap)
                 if chave not in vistos:
                     obtida = ap
-                    break  # ok
+                    break  # ok, aceita esta aposta
 
             if obtida is None:
-               # fallback duro: usa GA para garantir diversidade
-               try:
-                   obtida = sorted(self.gerar_por_algoritmo_genetico())
-               except Exception:
-                   # último recurso: repete a primeira (não deve ocorrer)
-                   obtida = apostas_final[0] if apostas_final else [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+                # fallback: usa GA para garantir diversidade
+                try:
+                    obtida = sorted(self.gerar_por_algoritmo_genetico())
+                except Exception:
+                    obtida = apostas_final[0] if apostas_final else [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
 
-           apostas_final.append(obtida)
-           vistos.add(tuple(obtida))
+            apostas_final.append(obtida)
+            vistos.add(tuple(obtida))
 
-       self.ultima_geracao_precisa = apostas_final
-       return self.ultima_geracao_precisa
+         self.ultima_geracao_precisa = apostas_final
+         return self.ultima_geracao_precisa
 
     def _precheck_precisa(self) -> None:
         """Valida pré-condições para o engine preciso."""
@@ -1249,6 +1246,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
