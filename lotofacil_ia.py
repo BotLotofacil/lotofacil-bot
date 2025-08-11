@@ -316,6 +316,12 @@ class BotLotofacil:
             for i in range(1, 16):
                 df[f'B{i}'] = df[f'B{i}'].astype(int)
 
+            # ⚠️ Ordena ANTES de calcular repetidos (garante temporalidade correta)
+            if 'numero' in df.columns:
+                df = df.sort_values('numero').reset_index(drop=True)
+            else:
+                df = df.sort_values('data').reset_index(drop=True)
+
             # Calcula corretamente os repetidos de 1 a 5 concursos anteriores
             for rep in range(1, 6):
                 repetidos = []
@@ -323,13 +329,10 @@ class BotLotofacil:
                     if idx < rep:
                         repetidos.append(0)
                     else:
-                        nums_atual = set([row[f'B{i}'] for i in range(1, 16)])
-                        nums_anterior = set([df.iloc[idx - rep][f'B{i}'] for i in range(1, 16)])
+                        nums_atual = {row[f'B{i}'] for i in range(1, 16)}
+                        nums_anterior = {df.iloc[idx - rep][f'B{i}'] for i in range(1, 16)}
                         repetidos.append(len(nums_atual & nums_anterior))
                 df[f'repetidos_{rep}'] = repetidos
-
-            # Ordena por número do concurso (do menor para o maior) e reseta o índice
-            df = df.sort_values('numero').reset_index(drop=True)
 
             # Seleciona apenas colunas relevantes
             cols_retorno = ['numero', 'data'] + [f'B{i}' for i in range(1,16)] + [f'repetidos_{j}' for j in range(1,6)]
@@ -349,17 +352,20 @@ class BotLotofacil:
         self.clusters = self.identificar_clusters()
 
     def calcular_coocorrencia(self) -> np.ndarray:
-        """Calcula matriz de coocorrência com pesos temporais"""
+        """Calcula matriz de coocorrência com pesos temporais (peso maior para sorteios recentes)."""
         cooc = np.zeros((25, 25))
-        for i in range(1, len(self.dados)):
+        N = len(self.dados)
+        for i in range(1, N):
             nums_atual = set(self.dados.iloc[i][[f'B{j}' for j in range(1,16)]].values)
             nums_anterior = set(self.dados.iloc[i-1][[f'B{k}' for k in range(1,16)]].values)
-            
+            # distância até o final (mais recente => dist=1 => peso maior)
+            dist = max(1, N - i)
+            w = 1.0 / (dist ** 0.5)
             for num1 in nums_atual:
                 for num2 in nums_anterior:
-                    cooc[num1-1, num2-1] += 1 / (i ** 0.5)  # Peso decrescente
+                    cooc[num1-1, num2-1] += w
         return cooc
-    
+
     def analisar_sequencias_iniciais(self) -> Dict[Tuple[int, int, int], int]:
         """Analisa padrões nos primeiros números sorteados"""
         sequencias = defaultdict(int)
@@ -396,16 +402,16 @@ class BotLotofacil:
         return clusters
     
     def construir_modelo(self) -> Optional[tf.keras.Model]:
-        """Constroi modelo LSTM avançado com otimizações"""
+        """Constroi modelo LSTM avançado com otimizações (validação temporal)."""
         if os.path.exists(self.modelo_path):
             try:
                 return tf.keras.models.load_model(self.modelo_path)
             except Exception as e:
                 logger.warning(f"Modelo corrompido. Recriando... Erro: {str(e)}")
                 os.remove(self.modelo_path)
-                
+            
         X, y = self.preparar_dados_treinamento()
-        
+
         model = tf.keras.Sequential([
             tf.keras.layers.Input(shape=(X.shape[1], X.shape[2])),
             tf.keras.layers.LSTM(128, return_sequences=True),
@@ -416,27 +422,44 @@ class BotLotofacil:
             tf.keras.layers.Dense(64, activation='relu'),
             tf.keras.layers.Dense(25, activation='sigmoid')
         ])
-        
+    
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
             loss='binary_crossentropy',
             metrics=['accuracy']
         )
-        
+    
         early = tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
         checkpoint = tf.keras.callbacks.ModelCheckpoint(self.modelo_path, save_best_only=True)
-        
-        model.fit(
-            X, y,
-            epochs=50,
-            batch_size=32,
-            validation_split=0.2,
-            callbacks=[early, checkpoint],
-            verbose=0
-        )
-        
-        return model
+
+        # ✅ Split temporal (80% treino, 20% validação), sem embaralhar
+        n = len(X)
+        if n < 10:
+            # fallback de segurança (dados muito curtos)
+            model.fit(
+                X, y,
+                epochs=50,
+                batch_size=32,
+                callbacks=[early, checkpoint],
+                shuffle=False,
+                verbose=0
+            )
+        else:
+            cut = int(n * 0.8)
+            X_train, y_train = X[:cut], y[:cut]
+            X_val,   y_val   = X[cut:], y[cut:]
+            model.fit(
+                X_train, y_train,
+                epochs=50,
+                batch_size=32,
+                validation_data=(X_val, y_val),
+                callbacks=[early, checkpoint],
+                shuffle=False,
+                verbose=0
+            )
     
+        return model
+
     def preparar_dados_treinamento(self) -> Tuple[np.ndarray, np.ndarray]:
         """Prepara dados para o modelo LSTM com janela temporal"""
         dados_numeros = self.dados[[f'B{i}' for i in range(1,16)]].values
@@ -554,41 +577,42 @@ class BotLotofacil:
         return aposta_final
     
     def avaliar_aposta_ga(self, aposta: List[int]) -> Tuple[float]:
-        """Função de fitness para o algoritmo genético"""
+        """Função de fitness para o algoritmo genético (penalidades aditivas)."""
         aposta = list(set(aposta))
         if len(aposta) != 15:
             return (0,)
-        
-        score = 0
-        
+    
+        score = 0.0
+    
         # Pontua por frequência histórica
         score += sum(self.frequencias[n] for n in aposta)
-        
+    
         # Pontua por coocorrência
         for i in aposta:
             for j in aposta:
                 if i != j:
                     score += self.coocorrencias[i-1, j-1] * 0.1
-        
-        # Pontua por clusters (2-4 números por cluster)
+    
+        # Pontua por clusters (2-4 números por cluster) – bônus mais suave
         for cluster in self.clusters.values():
             intersect = set(aposta) & set(cluster)
             if 2 <= len(intersect) <= 4:
-                score += 30
-        
-        # Penaliza se não seguir padrões estatísticos
+                score += 10.0  # antes era 30
+    
+        # Penaliza se não seguir padrões estatísticos (penalidade aditiva leve)
         pares = sum(1 for n in aposta if n % 2 == 0)
         soma = sum(aposta)
-        
+        penalty = 0.0
         if not (6 <= pares <= 8):
-            score *= 0.5
+            penalty += 10.0
         if not (185 <= soma <= 215):
-            score *= 0.5
-            
-        # Verifica sequência inicial
+            penalty += 10.0
+        score -= penalty
+        
+        # Reforço por sequência inicial comum
         seq_inicial = tuple(sorted(aposta)[:3])
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
-        
+    
         return (score,)
 
     def gerar_aposta_precisa(self, n_apostas: int = 5, seed: Optional[int] = None) -> List[List[int]]:
@@ -1184,3 +1208,4 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
