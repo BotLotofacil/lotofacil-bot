@@ -143,7 +143,7 @@ DATA_DIR = os.getenv("DATA_DIR")
 if DATA_DIR:
     os.makedirs(DATA_DIR, exist_ok=True)
     # Copia arquivos iniciais para o volume, se ausentes
-    for _fn in ("lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.h5"):
+    for _fn in ("lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.keras"):
         src = os.path.join(os.getcwd(), _fn)
         dst = os.path.join(DATA_DIR, _fn)
         if (not os.path.exists(dst)) and os.path.exists(src):
@@ -151,11 +151,14 @@ if DATA_DIR:
                 shutil.copy2(src, dst)
             except Exception as e:
                 logger.warning(f"Não foi possível copiar {src} -> {dst}: {e}")
-    # Passa a trabalhar dentro do volume
+
+    # Remove modelo legado .h5 se existir no volume para evitar confusão
     try:
-        os.chdir(DATA_DIR)
-    except Exception as e:
-        logger.warning(f"Falha ao trocar para DATA_DIR ({DATA_DIR}): {e}")
+        old_h5 = os.path.join(DATA_DIR, "modelo_lotofacil_avancado.h5")
+        if os.path.exists(old_h5):
+            os.remove(old_h5)
+    except Exception:
+        pass
 
 # Admins e rate-limit
 ADMIN_USER_IDS: List[int] = [5344714174]  # ajuste conforme necessário
@@ -264,7 +267,7 @@ class BotLotofacil:
         self.security = SecurityManager()
         self.cache_dir = "cache"
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.modelo_path = 'modelo_lotofacil_avancado.h5'
+        self.modelo_path = 'modelo_lotofacil_avancado.keras'
         self.dados = self.carregar_dados()
         if self.dados is not None:
             self.analisar_dados()
@@ -451,14 +454,18 @@ class BotLotofacil:
         return clusters
 
     def construir_modelo(self) -> Optional[tf.keras.Model]:
-        """Constroi modelo LSTM avançado com otimizações (validação temporal)."""
+        """Constroi/recupera modelo LSTM com salvamento no formato Keras (.keras)."""
+        # tenta carregar o .keras; se quebrar, apaga e recria
         if os.path.exists(self.modelo_path):
             try:
                 return tf.keras.models.load_model(self.modelo_path)
             except Exception as e:
-                logger.warning(f"Modelo corrompido. Recriando... Erro: {str(e)}")
-                os.remove(self.modelo_path)
-            
+                logger.warning(f"Modelo corrompido/incompatível. Recriando... Erro: {e}")
+                try:
+                    os.remove(self.modelo_path)
+                except Exception:
+                    pass
+
         X, y = self.preparar_dados_treinamento()
 
         model = tf.keras.Sequential([
@@ -469,19 +476,22 @@ class BotLotofacil:
             tf.keras.layers.LSTM(64),
             tf.keras.layers.Dropout(0.2),
             tf.keras.layers.Dense(64, activation='relu'),
-            tf.keras.layers.Dense(25, activation='sigmoid')
+            tf.keras.layers.Dense(25, activation='sigmoid'),
         ])
-    
+
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
             loss='binary_crossentropy',
-            metrics=['accuracy']
+            metrics=['accuracy'],
         )
-    
-        early = tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
-        checkpoint = tf.keras.callbacks.ModelCheckpoint(self.modelo_path, save_best_only=True)
 
-        # ✅ Split temporal (80% treino, 20% validação), sem embaralhar
+        early = tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
+        # salva diretamente no .keras
+        checkpoint = tf.keras.callbacks.ModelCheckpoint(
+            filepath=self.modelo_path,
+            save_best_only=True
+        )
+
         n = len(X)
         if n < 10:
             # fallback de segurança (dados muito curtos)
@@ -496,7 +506,7 @@ class BotLotofacil:
         else:
             cut = int(n * 0.8)
             X_train, y_train = X[:cut], y[:cut]
-            X_val,   y_val   = X[cut:], y[cut:]
+            X_val, y_val = X[cut:], y[cut:]
             model.fit(
                 X_train, y_train,
                 epochs=50,
@@ -506,7 +516,13 @@ class BotLotofacil:
                 shuffle=False,
                 verbose=0
             )
-    
+
+        # garante que o melhor modelo está salvo em .keras
+        try:
+            model.save(self.modelo_path)
+        except Exception:
+            pass
+
         return model
 
     def preparar_dados_treinamento(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -1438,6 +1454,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
