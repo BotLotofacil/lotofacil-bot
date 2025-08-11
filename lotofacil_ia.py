@@ -580,39 +580,40 @@ class BotLotofacil:
         """Função de fitness para o algoritmo genético (penalidades aditivas)."""
         aposta = list(set(aposta))
         if len(aposta) != 15:
-            return (0,)
-    
+            return (0.0,)
+
         score = 0.0
-    
+
         # Pontua por frequência histórica
         score += sum(self.frequencias[n] for n in aposta)
-    
+
         # Pontua por coocorrência
         for i in aposta:
             for j in aposta:
                 if i != j:
                     score += self.coocorrencias[i-1, j-1] * 0.1
-    
-        # Pontua por clusters (2-4 números por cluster) – bônus mais suave
+
+        # Pontua por clusters (2–4 números por cluster) – bônus suave
         for cluster in self.clusters.values():
             intersect = set(aposta) & set(cluster)
             if 2 <= len(intersect) <= 4:
-                score += 10.0  # antes era 30
-    
-        # Penaliza se não seguir padrões estatísticos (penalidade aditiva leve)
+                score += 10.0
+
+        # Penalidades apenas aditivas (faixas mais amplas para reduzir viés)
         pares = sum(1 for n in aposta if n % 2 == 0)
         soma = sum(aposta)
         penalty = 0.0
-        if not (6 <= pares <= 8):
+        if not (5 <= pares <= 10):
             penalty += 10.0
-        if not (185 <= soma <= 215):
+        if not (160 <= soma <= 220):
             penalty += 10.0
-        score -= penalty
-        
+
         # Reforço por sequência inicial comum
         seq_inicial = tuple(sorted(aposta)[:3])
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
-    
+
+        # Aplica penalidade no final (tudo aditivo)
+        score -= penalty
         return (score,)
 
     def gerar_aposta_precisa(self, n_apostas: int = 5, seed: Optional[int] = None) -> List[List[int]]:
@@ -1208,4 +1209,5 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
