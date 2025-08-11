@@ -142,6 +142,7 @@ if not TOKEN:
 DATA_DIR = os.getenv("DATA_DIR")
 if DATA_DIR:
     os.makedirs(DATA_DIR, exist_ok=True)
+
     # Copia arquivos iniciais para o volume, se ausentes
     for _fn in ("lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.keras"):
         src = os.path.join(os.getcwd(), _fn)
@@ -159,6 +160,13 @@ if DATA_DIR:
             os.remove(old_h5)
     except Exception:
         pass
+
+    # Passa a trabalhar dentro do volume
+    try:
+        os.chdir(DATA_DIR)
+    except Exception as e:
+        logger.warning(f"Falha ao trocar para DATA_DIR ({DATA_DIR}): {e}")
+
 
 # Admins e rate-limit
 ADMIN_USER_IDS: List[int] = [5344714174]  # ajuste conforme necessário
@@ -1454,6 +1462,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
