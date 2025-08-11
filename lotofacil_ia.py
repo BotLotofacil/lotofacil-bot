@@ -304,13 +304,11 @@ class BotLotofacil:
             self.precise_last_error = str(e)
             logger.warning(f"Engine precisa desativado no startup: {e}")
 
+    # -------------------------
+    # Dados / preparação
+    # -------------------------
     def carregar_dados(self, atualizar: bool = False) -> Optional[pd.DataFrame]:
-        """
-        Carrega dados históricos apenas do arquivo local CSV, sempre recalculando os repetidos ao atualizar.
-        Após o processamento, sobrescreve o arquivo CSV para garantir persistência das colunas.
-        """
         cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
-
         if not atualizar and os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
@@ -323,14 +321,12 @@ class BotLotofacil:
             return None
 
         df = pd.read_csv('lotofacil_historico.csv')
-
         processed = self.preprocessar_dados(df) if df is not None else None
 
         if processed is not None:
             try:
                 with open(cache_file, 'wb') as f:
                     pickle.dump(processed, f)
-                # Salva o arquivo CSV atualizado com colunas de repetidos
                 processed.to_csv('lotofacil_historico.csv', index=False)
             except Exception as e:
                 logger.error(f"Falha ao salvar cache ou CSV: {str(e)}")
@@ -338,16 +334,12 @@ class BotLotofacil:
         return processed
 
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Versão otimizada e robusta para CSV da Lotofácil (B1-B15 + repetidos_X)"""
         try:
-            # Verificação robusta do formato esperado
             required_cols = ['data'] + [f'B{i}' for i in range(1,16)]
             if not all(col in df.columns for col in required_cols):
                 logger.error(f"Colunas obrigatórias faltantes. Esperado: {required_cols}")
                 return None
 
-            # Conversão robusta do campo data (aceita YYYY-MM-DD e DD/MM/YYYY)
-            # Primeiro tenta o padrão ISO, depois o padrão brasileiro
             try:
                 df['data'] = pd.to_datetime(df['data'], format='%Y-%m-%d', errors='raise')
             except Exception:
@@ -356,12 +348,10 @@ class BotLotofacil:
                 except Exception:
                     df['data'] = pd.to_datetime(df['data'], dayfirst=True, errors='coerce')
 
-            # Remoção de linhas com datas não reconhecidas
             if df['data'].isnull().any():
                 logger.warning(f"Linhas descartadas por data inválida: {df['data'].isnull().sum()}")
                 df = df.dropna(subset=['data'])
 
-            # Garante o campo 'numero'
             if 'numero' in df.columns:
                 df['numero'] = df['numero'].astype(int)
             elif 'concurso' in df.columns:
@@ -369,17 +359,14 @@ class BotLotofacil:
             else:
                 df['numero'] = range(1, len(df)+1)
 
-            # Conversão dos campos de dezenas para inteiro (garante que não haja valores string)
             for i in range(1, 16):
                 df[f'B{i}'] = df[f'B{i}'].astype(int)
 
-            # ⚠️ Ordena ANTES de calcular repetidos (garante temporalidade correta)
             if 'numero' in df.columns:
                 df = df.sort_values('numero').reset_index(drop=True)
             else:
                 df = df.sort_values('data').reset_index(drop=True)
 
-            # Calcula corretamente os repetidos de 1 a 5 concursos anteriores
             for rep in range(1, 6):
                 repetidos = []
                 for idx, row in df.iterrows():
@@ -391,7 +378,6 @@ class BotLotofacil:
                         repetidos.append(len(nums_atual & nums_anterior))
                 df[f'repetidos_{rep}'] = repetidos
 
-            # Seleciona apenas colunas relevantes
             cols_retorno = ['numero', 'data'] + [f'B{i}' for i in range(1,16)] + [f'repetidos_{j}' for j in range(1,6)]
             return df[cols_retorno]
 
@@ -400,8 +386,6 @@ class BotLotofacil:
             return None
 
     def analisar_dados(self) -> None:
-        """Realiza análises estatísticas avançadas SEM cache de frequências"""
-        # Calcula a frequência real dos números (B1 a B15), garantindo todos de 1 a 25
         contagem = Counter(self.dados.filter(like='B').values.flatten())
         self.frequencias = Counter({n: contagem.get(n, 0) for n in range(1, 26)})
         self.coocorrencias = self.calcular_coocorrencia()
@@ -409,13 +393,11 @@ class BotLotofacil:
         self.clusters = self.identificar_clusters()
 
     def calcular_coocorrencia(self) -> np.ndarray:
-        """Calcula matriz de coocorrência com pesos temporais (peso maior para sorteios recentes)."""
         cooc = np.zeros((25, 25))
         N = len(self.dados)
         for i in range(1, N):
             nums_atual = set(self.dados.iloc[i][[f'B{j}' for j in range(1,16)]].values)
             nums_anterior = set(self.dados.iloc[i-1][[f'B{k}' for k in range(1,16)]].values)
-            # distância até o final (mais recente => dist=1 => peso maior)
             dist = max(1, N - i)
             w = 1.0 / (dist ** 0.5)
             for num1 in nums_atual:
@@ -424,18 +406,15 @@ class BotLotofacil:
         return cooc
 
     def analisar_sequencias_iniciais(self) -> Dict[Tuple[int, int, int], int]:
-        """Analisa padrões nos primeiros números sorteados"""
         sequencias = defaultdict(int)
         for _, row in self.dados.iterrows():
             nums_ordenados = sorted(row[[f'B{i}' for i in range(1,16)]].values)
-            chave = tuple(nums_ordenados[:3])  # Analisa os 3 primeiros números
+            chave = tuple(nums_ordenados[:3])
             sequencias[chave] += 1
         return sequencias
-    
-    def identificar_clusters(self) -> Dict[int, List[int]]:
-        """Identifica clusters dinâmicos com cache (sem warnings de feature names)."""
-        cache_file = os.path.join(self.cache_dir, "clusters_cache.pkl")
 
+    def identificar_clusters(self) -> Dict[int, List[int]]:
+        cache_file = os.path.join(self.cache_dir, "clusters_cache.pkl")
         try:
             if os.path.exists(cache_file):
                 with open(cache_file, 'rb') as f:
@@ -443,13 +422,12 @@ class BotLotofacil:
         except Exception as e:
             logger.warning(f"Cache de clusters corrompido. Recriando... Erro: {str(e)}")
 
-        # Treina com DataFrame e também PREDIZ com DataFrame (mesmas colunas) para evitar warnings
         dados_cluster = self.dados[[f'B{i}' for i in range(1, 16)]]
         kmeans = KMeans(n_clusters=4, random_state=42).fit(dados_cluster)
 
         clusters: Dict[int, List[int]] = {i: [] for i in range(4)}
         for num in range(1, 26):
-            sample = pd.DataFrame([[num] * 15], columns=dados_cluster.columns)  # mantém nomes de features
+            sample = pd.DataFrame([[num] * 15], columns=dados_cluster.columns)
             cluster = kmeans.predict(sample)[0]
             clusters[cluster].append(num)
 
@@ -462,8 +440,6 @@ class BotLotofacil:
         return clusters
 
     def construir_modelo(self) -> Optional[tf.keras.Model]:
-        """Constroi/recupera modelo LSTM com salvamento no formato Keras (.keras)."""
-        # tenta carregar o .keras; se quebrar, apaga e recria
         if os.path.exists(self.modelo_path):
             try:
                 return tf.keras.models.load_model(self.modelo_path)
@@ -494,86 +470,136 @@ class BotLotofacil:
         )
 
         early = tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
-        # salva diretamente no .keras
-        checkpoint = tf.keras.callbacks.ModelCheckpoint(
-            filepath=self.modelo_path,
-            save_best_only=True
-        )
+        checkpoint = tf.keras.callbacks.ModelCheckpoint(filepath=self.modelo_path, save_best_only=True)
 
         n = len(X)
         if n < 10:
-            # fallback de segurança (dados muito curtos)
-            model.fit(
-                X, y,
-                epochs=50,
-                batch_size=32,
-                callbacks=[early, checkpoint],
-                shuffle=False,
-                verbose=0
-            )
+            model.fit(X, y, epochs=50, batch_size=32, callbacks=[early, checkpoint], shuffle=False, verbose=0)
         else:
             cut = int(n * 0.8)
             X_train, y_train = X[:cut], y[:cut]
             X_val, y_val = X[cut:], y[cut:]
-            model.fit(
-                X_train, y_train,
-                epochs=50,
-                batch_size=32,
-                validation_data=(X_val, y_val),
-                callbacks=[early, checkpoint],
-                shuffle=False,
-                verbose=0
-            )
+            model.fit(X_train, y_train, epochs=50, batch_size=32,
+                      validation_data=(X_val, y_val), callbacks=[early, checkpoint],
+                      shuffle=False, verbose=0)
 
-        # garante que o melhor modelo está salvo em .keras
         try:
             model.save(self.modelo_path)
         except Exception:
             pass
-
         return model
 
     def preparar_dados_treinamento(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepara dados para o modelo LSTM com janela temporal"""
         dados_numeros = self.dados[[f'B{i}' for i in range(1,16)]].values
         X, y = [], []
-        
-        janela = 10  # Analisa 10 concursos anteriores
-        
+        janela = 10
         for i in range(janela, len(dados_numeros)):
-            # Dados dos números
             seq_numeros = dados_numeros[i-janela:i]
-            
-            # Transforma em vetor binário (25 posições)
             seq_bin = np.zeros((janela, 25))
             for j in range(janela):
                 for num in seq_numeros[j]:
                     seq_bin[j, num-1] = 1
-            
-            # Adiciona features adicionais se existirem
+
             features_extras = []
             for k in range(1,6):
                 col_name = f'repetidos_{k}'
-                if col_name in self.dados.columns:
-                    features_extras.append(self.dados.iloc[i-1][col_name])
-                else:
-                    features_extras.append(0)
-            
+                features_extras.append(self.dados.iloc[i-1][col_name] if col_name in self.dados.columns else 0)
             features_extras = np.array(features_extras).reshape(1, -1)
-            
-            # Combina tudo
+
             X_seq = np.concatenate([seq_bin, np.tile(features_extras, (janela, 1))], axis=1)
-            
-            # Target (binário para os números sorteados)
+
             target = np.zeros(25)
             for num in dados_numeros[i]:
                 target[num-1] = 1
-                
+
             X.append(X_seq)
             y.append(target)
-        
         return np.array(X), np.array(y)
 
+    # -------------------------
+    # Helpers de regras/viés
+    # -------------------------
+    def _maior_sequencia_consecutivos(self, aposta: List[int]) -> int:
+        if not aposta:
+            return 0
+        nums = sorted(aposta)
+        best = cur = 1
+        for i in range(1, len(nums)):
+            if nums[i] == nums[i-1] + 1:
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 1
+        return best
+
+    def _tem_prefixo_123(self, aposta: List[int]) -> bool:
+        s = set(aposta)
+        return {1, 2, 3}.issubset(s)
+
+    def _diferenca_minima(self, ap: List[int], existentes: List[List[int]], min_diff: int = 4) -> bool:
+        s = set(ap)
+        for e in existentes:
+            comum = len(s & set(e))
+            if 15 - comum < min_diff:
+                return False
+        return True
+
+    def _valida_regras_basicas(self, ap: List[int]) -> bool:
+        """Checagem rápida de sanidade das apostas."""
+        if len(ap) != 15 or len(set(ap)) != 15:
+            return False
+        if any(n < 1 or n > 25 for n in ap):
+            return False
+        pares = sum(1 for n in ap if n % 2 == 0)
+        soma = sum(ap)
+        if not (5 <= pares <= 10):
+            return False
+        if not (160 <= soma <= 220):
+            return False
+        if self._maior_sequencia_consecutivos(ap) >= 5:
+            return False
+        return True
+
+    def _repara(self, ap: List[int], rng: random.Random) -> List[int]:
+        """Ajusta aposta para 15 únicos e dentro das faixas (pares/soma), com limite de tentativas."""
+        ap = sorted(set(int(x) for x in ap if 1 <= int(x) <= 25))
+        # completa até 15
+        while len(ap) < 15:
+            n = rng.randrange(1, 26)
+            if n not in ap:
+                ap.append(n)
+        ap = sorted(ap[:15])
+
+        tent = 0
+        while not self._valida_regras_basicas(ap) and tent < 30:
+            pares = sum(1 for n in ap if n % 2 == 0)
+            soma = sum(ap)
+            # decide quem tirar
+            if pares > 10:
+                cand = [n for n in ap if n % 2 == 0]
+            elif pares < 5:
+                cand = [n for n in ap if n % 2 == 1]
+            elif soma > 220:
+                cand = [n for n in ap if n > 13]
+            elif soma < 160:
+                cand = [n for n in ap if n < 13]
+            else:
+                cand = ap[:]
+            sai = rng.choice(cand)
+            ap.remove(sai)
+
+            # escolhe entrada que melhora cobertura e regras
+            fora = [n for n in range(1, 26) if n not in ap]
+            rng.shuffle(fora)
+            entra = fora[0]
+            ap.append(entra)
+            ap = sorted(ap)
+            tent += 1
+        return ap
+
+    # -------------------------
+    # Motores de geração
+    # -------------------------
     def _mutacao_suave(
         self,
         aposta: List[int],
@@ -583,13 +609,6 @@ class BotLotofacil:
         tol_score: float = 3.0,
         p_aplicar: float = 0.5,
     ) -> List[int]:
-        """
-        Faz 0–2 trocas leves para aumentar diversidade.
-        Regras:
-          - mantém 15 números únicos
-          - mantém pares em [5,10] e soma em [160,220]
-          - aceita se score não cair além de tol_score
-        """
         if rng.random() > p_aplicar:
             return aposta[:]
 
@@ -637,85 +656,31 @@ class BotLotofacil:
 
         return tentativa
 
-    def _maior_sequencia_consecutivos(self, aposta: List[int]) -> int:
-        """Retorna o tamanho da maior sequência de consecutivos na aposta."""
-        if not aposta:
-            return 0
-        nums = sorted(aposta)
-        best = cur = 1
-        for i in range(1, len(nums)):
-            if nums[i] == nums[i-1] + 1:
-                cur += 1
-                best = max(best, cur)
-            else:
-                cur = 1
-        return best
-
-    def _tem_prefixo_123(self, aposta: List[int]) -> bool:
-        """True se {1,2,3} estiver inteiro na aposta."""
-        s = set(aposta)
-        return {1,2,3}.issubset(s)
-
-    def _diferenca_minima(self, ap: List[int], existentes: List[List[int]], min_diff: int = 4) -> bool:
-        """Garante que a aposta difere de TODAS as já geradas por pelo menos min_diff dezenas."""
-        s = set(ap)
-        for e in existentes:
-            comum = len(s & set(e))
-            if 15 - comum < min_diff:
-                return False
-        return True
-
-    def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
-        apostas = []
-        usa_modelo = hasattr(self, "modelo") and self.modelo is not None and len(self.dados) >= 10
-
-        for _ in range(n_apostas):
-            aposta_ga = self.gerar_por_algoritmo_genetico()
-            if usa_modelo:
-                try:
-                    aposta_modelo = self.gerar_por_modelo()
-                    aposta_final = self.combinar_apostas(aposta_modelo, aposta_ga)
-                except Exception as e:
-                    logger.warning(f"Falha em gerar_por_modelo: {e}. Usando só GA para esta aposta.")
-                    usa_modelo = False
-                    aposta_final = sorted(aposta_ga)
-            else:
-                aposta_final = sorted(aposta_ga)
-            apostas.append(aposta_final)
-
-        return self.aplicar_fechamento(apostas)
-
     def gerar_por_modelo(self) -> List[int]:
         if not hasattr(self, "modelo") or self.modelo is None:
             raise RuntimeError("Modelo LSTM indisponível.")
         ult = self.dados[[f'B{i}' for i in range(1,16)]].values[-10:]
-        t = len(ult)  # pode ser < 10
+        t = len(ult)
         X = np.zeros((1, 10, 25 + 5))
-
-        # Preenche só o que existe
         for i in range(t):
-            row = ult[-t + i]  # i caminha do mais antigo ao mais recente dentro da janela disponível
+            row = ult[-t + i]
             for num in row:
                 X[0, i, num - 1] = 1
             for j in range(1, 6):
                 col_name = f'repetidos_{j}'
                 if col_name in self.dados.columns:
-                    # usa a mesma linha temporal correspondente
                     X[0, i, 25 + j - 1] = self.dados.iloc[-t + i][col_name]
-
         pred = self.modelo.predict(X, verbose=0)[0]
         return sorted([i + 1 for i in np.argsort(pred)[-15:]])
 
     def gerar_por_algoritmo_genetico(self) -> List[int]:
-        """Gera aposta usando algoritmo genético com restrições"""
-        # Evita redefinir classes caso já existam
         if not hasattr(self, "_creator_classes_defined"):
             try:
                 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
                 creator.create("Individual", list, fitness=creator.FitnessMax)
                 self._creator_classes_defined = True
             except Exception:
-                pass  # Classes já foram criadas em execuções anteriores
+                pass
 
         toolbox = base.Toolbox()
         toolbox.register("attr_num", random.randint, 1, 25)
@@ -725,46 +690,36 @@ class BotLotofacil:
         toolbox.register("mate", tools.cxTwoPoint)
         toolbox.register("mutate", tools.mutUniformInt, low=1, up=25, indpb=0.15)
         toolbox.register("select", tools.selTournament, tournsize=3)
-    
+
         pop = toolbox.population(n=200)
         algorithms.eaSimple(pop, toolbox, cxpb=0.7, mutpb=0.3, ngen=40, verbose=False)
-    
         melhor = tools.selBest(pop, k=1)[0]
-        # GARANTE 15 números únicos e ordenados entre 1 e 25
         aposta_final = sorted(set(melhor))
         while len(aposta_final) < 15:
             candidatos = [n for n in range(1, 26) if n not in aposta_final]
             aposta_final.append(random.choice(candidatos))
             aposta_final = sorted(aposta_final)
-        # Caso tenha mais que 15 (por alguma operação), corta para 15
         aposta_final = aposta_final[:15]
         return aposta_final
-    
+
     def avaliar_aposta_ga(self, aposta: List[int]) -> Tuple[float]:
-        """Função de fitness para o algoritmo genético (penalidades aditivas + mitigação de viés)."""
-        # Normaliza e valida a aposta
         aposta = list(set(aposta))
         if len(aposta) != 15:
             return (0.0,)
 
         score = 0.0
-
-        # 1) Pontuação por frequência histórica
         score += sum(self.frequencias[n] for n in aposta)
 
-        # 2) Pontuação por coocorrência (pares ordenados i != j)
         for i in aposta:
             for j in aposta:
                 if i != j:
                     score += self.coocorrencias[i-1, j-1] * 0.1
 
-        # 3) Bônus por clusters (2–4 números por cluster) — incentivo suave
         for cluster in self.clusters.values():
             intersect = set(aposta) & set(cluster)
             if 2 <= len(intersect) <= 4:
                 score += 10.0
 
-        # 4) Penalidades aditivas (faixas amplas para reduzir viés global)
         pares = sum(1 for n in aposta if n % 2 == 0)
         soma = sum(aposta)
         penalty = 0.0
@@ -773,30 +728,82 @@ class BotLotofacil:
         if not (160 <= soma <= 220):
             penalty += 10.0
 
-        # 5) Reforço por sequência inicial comum (padrão histórico)
         seq_inicial = tuple(sorted(aposta)[:3])
         score += self.sequencias_iniciais.get(seq_inicial, 0) * 0.5
 
-        # 6) Mitigação de viés estrutural (leve)
         if {1, 2, 3}.issubset(set(aposta)):
             score -= 6.0
         run_len = self._maior_sequencia_consecutivos(aposta)
         if run_len >= 4:
             score -= (run_len - 3) * 4.0
 
-        # 7) Penalidade agregada no final
         score -= penalty
         return (score,)
 
+    def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
+        """Fallback clássico: GA + (opcional) modelo, com fechamento ao final."""
+        apostas = []
+        usa_modelo = hasattr(self, "modelo") and self.modelo is not None and len(self.dados) >= 10
+        for _ in range(n_apostas):
+            aposta_ga = self.gerar_por_algoritmo_genetico()
+            if usa_modelo:
+                try:
+                    aposta_modelo = self.gerar_por_modelo()
+                    aposta_final = self.combinar_apostas(aposta_modelo, aposta_ga)
+                except Exception:
+                    aposta_final = sorted(aposta_ga)
+            else:
+                aposta_final = sorted(aposta_ga)
+            apostas.append(aposta_final)
+        return self.aplicar_fechamento(apostas)
+
+
+    # -------------------------
+    # Anti-viés / diversidade forte
+    # -------------------------
+    def _forca_quebra_123(self, ap: List[int], rng: random.Random) -> List[int]:
+        if self._tem_prefixo_123(ap):
+            tira = rng.choice([1, 2, 3])
+            resto = [x for x in ap if x != tira]
+            fora = [n for n in range(1, 26) if n not in resto]
+            entra = rng.choice(fora)
+            resto.append(entra)
+            ap = sorted(resto)
+            ap = self._repara(ap, rng)
+        return ap
+
+    def _forca_diversidade_lote(
+        self,
+        lote: List[List[int]],
+        min_diff: int,
+        rng: random.Random,
+        cobertura_execucao: Counter
+    ) -> List[List[int]]:
+        final: List[List[int]] = []
+        vistos: Set[Tuple[int, ...]] = set()
+        for ap in lote:
+            ap = self._forca_quebra_123(ap, rng)
+            tent = 0
+            while final and (min(15 - len(set(ap) & set(e)) for e in final) < min_diff) and tent < 20:
+                ap = self._mutacao_suave(ap, rng, cobertura_execucao, max_trocas=3, tol_score=4.0, p_aplicar=1.0)
+                ap = self._repara(ap, rng)
+                tent += 1
+            tent = 0
+            key = tuple(sorted(ap))
+            while key in vistos and tent < 20:
+                ap = self._mutacao_suave(ap, rng, cobertura_execucao, max_trocas=3, tol_score=4.0, p_aplicar=1.0)
+                ap = self._repara(ap, rng)
+                key = tuple(sorted(ap))
+                tent += 1
+            final.append(sorted(ap))
+            vistos.add(key)
+        return final
+
     def gerar_aposta_precisa(self, n_apostas: int = 5, seed: Optional[int] = None) -> List[List[int]]:
-        """
-        Gera apostas usando o núcleo preciso (score + GRASP + diversidade) a partir de self.dados,
-        garantindo diversidade (sem duplicatas) e variando a semente por aposta.
-        """
+        """Versão sem viés: candidatos múltiplos + avaliação + pós-processamento forte."""
         if self.dados is None or len(self.dados) == 0:
             raise RuntimeError("Dados indisponíveis para geração precisa.")
 
-        # Histórico do mais antigo ao mais recente
         df = self.dados
         if 'numero' in df.columns:
             df = df.sort_values('numero').reset_index(drop=True)
@@ -805,11 +812,11 @@ class BotLotofacil:
         else:
             df = df.reset_index(drop=True)
 
-        historico: List[List[int]] = []
-        for _, row in df.iterrows():
-            historico.append([int(row[f'B{i}']) for i in range(1, 16)])
+        historico: List[List[int]] = [
+            [int(row[f'B{i}']) for i in range(1, 16)]
+            for _, row in df.iterrows()
+        ]
 
-        # Semente base (reprodutível por concurso), mas variada por aposta
         if seed is None:
             try:
                 seed = int(df['numero'].max()) + 1
@@ -817,77 +824,108 @@ class BotLotofacil:
                 seed = len(df) + 1
 
         n_alvo = max(1, min(int(n_apostas), 10))
-        apostas_final: List[List[int]] = []
+        rng_global = random.Random(seed)
+        cobertura_execucao = Counter()
         vistos: Set[Tuple[int, ...]] = set()
-        cobertura_execucao = Counter()  # cobertura dentro desta execução
+        apostas_tmp: List[List[int]] = []
+
+        MIN_DIFF = 8
+        CAND_POR_POS = 10
+
+        def _ganho_cobertura(ap: List[int]) -> float:
+            return sum(1.0 / (1.0 + cobertura_execucao[n]) for n in ap)
 
         for i in range(n_alvo):
-            rng = random.Random(seed + i*7919 if seed is not None else None)
+            cand_list: List[List[int]] = []
 
-            obtida: Optional[List[int]] = None
-            for tentativa in range(8):
-                seed_i = (seed or 0) + (i * 997) + (tentativa * 37)
+            # 1) Engine precisa com seeds variados
+            for t in range(4):
                 try:
                     geradas = gerar_apostas_precisas(
-                        historico, quantidade=1, seed=seed_i, cfg=self.cfg_precisa
+                        historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
                     )
+                    if geradas:
+                        cand_list.append(sorted(set(map(int, geradas[0])))[:15])
                 except Exception:
-                    continue
+                    pass
 
-                if not geradas:
-                    continue
+            # 2) GA (várias execuções)
+            for _ in range(3):
+                cand_list.append(self.gerar_por_algoritmo_genetico())
 
-                ap = sorted(map(int, geradas[0]))
-                if tuple(ap) not in vistos:
-                    obtida = ap
+            # 3) Modelo (se houver)
+            if hasattr(self, "modelo") and self.modelo is not None and len(self.dados) >= 10:
+                try:
+                    cand_list.append(self.gerar_por_modelo())
+                except Exception:
+                    pass
+
+            # 4) Mutações em cima dos candidatos
+            base_for_mut = cand_list[:]
+            for ap in base_for_mut:
+                cand_list.append(self._mutacao_suave(ap, rng_global, cobertura_execucao,
+                                                     max_trocas=2, tol_score=3.0, p_aplicar=1.0))
+
+            # 5) Reparo + filtros duros + pré-diversidade local
+            candidatos_validos: List[List[int]] = []
+            seen_local: Set[Tuple[int, ...]] = set()
+            for ap in cand_list:
+                ap = self._repara(ap, rng_global)
+                if not self._valida_regras_basicas(ap):
+                    continue
+                ap = self._forca_quebra_123(ap, rng_global)
+                if candidatos_validos and min(15 - len(set(ap) & set(e)) for e in candidatos_validos) < 4:
+                    continue
+                key = tuple(sorted(ap))
+                if key in seen_local:
+                    continue
+                seen_local.add(key)
+                candidatos_validos.append(ap)
+                if len(candidatos_validos) >= CAND_POR_POS:
                     break
 
-            if obtida is None:
-                try:
-                    obtida = sorted(self.gerar_por_algoritmo_genetico())
-                except Exception:
-                    obtida = apostas_final[0] if apostas_final else [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+            # fallback aleatório reparado
+            while len(candidatos_validos) < max(3, CAND_POR_POS // 2):
+                ap = [rng_global.randrange(1, 26) for _ in range(15)]
+                ap = self._repara(ap, rng_global)
+                ap = self._forca_quebra_123(ap, rng_global)
+                key = tuple(sorted(ap))
+                if key not in seen_local and self._valida_regras_basicas(ap):
+                    seen_local.add(key)
+                    candidatos_validos.append(ap)
 
-            # >>> mitigação de viés + micro-variabilidade controlada <<<
-            # 3.1) aplica mutação suave padrão
-            obtida = self._mutacao_suave(
-                aposta=obtida,
-                rng=rng,
-                cobertura_execucao=cobertura_execucao,
-                max_trocas=2,
-                tol_score=3.0,
-                p_aplicar=0.5,
-            )
+            # 6) score leve + diversidade contra lote temporário
+            def _score_total(ap: List[int]) -> float:
+                fit = self.avaliar_aposta_ga(ap)[0]
+                dist = 0.0 if not apostas_tmp else min(15 - len(set(ap) & set(e)) for e in apostas_tmp)
+                cover = _ganho_cobertura(ap)
+                return fit * 1.0 + dist * 2.2 + cover * 1.0
 
-            # 3.2) se detectar viés (prefixo 1-2-3, sequência longa) ou baixa diversidade no lote,
-            #     força 1-2 mutações adicionais com p=1.0 e max_trocas maiores
-            needs_break = self._tem_prefixo_123(obtida) or self._maior_sequencia_consecutivos(obtida) >= 4 \
-                          or not self._diferenca_minima(obtida, apostas_final, min_diff=4)
-            if needs_break:
-                for _ in range(2):  # até 2 tentativas extra para quebrar padrão
-                    obtida = self._mutacao_suave(
-                        aposta=obtida,
-                        rng=rng,
-                        cobertura_execucao=cobertura_execucao,
-                        max_trocas=3,
-                        tol_score=4.0,
-                        p_aplicar=1.0,  # força tentar
-                    )
-                    if self._maior_sequencia_consecutivos(obtida) < 4 and \
-                       not self._tem_prefixo_123(obtida) and \
-                       self._diferenca_minima(obtida, apostas_final, min_diff=4):
-                        break
-            # <<< fim mitigação >>>
+            escolhido = max(candidatos_validos, key=_score_total)
+            # evita duplicata global
+            tries = 0
+            key = tuple(sorted(escolhido))
+            while key in vistos and tries < 12:
+                escolhido = self._mutacao_suave(escolhido, rng_global, cobertura_execucao,
+                                                max_trocas=3, tol_score=4.0, p_aplicar=1.0)
+                escolhido = self._repara(escolhido, rng_global)
+                escolhido = self._forca_quebra_123(escolhido, rng_global)
+                key = tuple(sorted(escolhido))
+                tries += 1
 
-            apostas_final.append(obtida)
-            vistos.add(tuple(obtida))
-            cobertura_execucao.update(obtida)
-    
-        self.ultima_geracao_precisa = apostas_final
+            vistos.add(key)
+            apostas_tmp.append(sorted(escolhido))
+            cobertura_execucao.update(escolhido)
+
+        # 7) Cinturão final: quebra {1,2,3}, distância mínima e unicidade
+        apostas_final = self._forca_diversidade_lote(apostas_tmp, MIN_DIFF, rng_global, cobertura_execucao)
+        self.ultima_geracao_precisa = [sorted(ap) for ap in apostas_final]
         return self.ultima_geracao_precisa
 
+    # -------------------------
+    # Checks de saúde
+    # -------------------------
     def _precheck_precisa(self) -> None:
-        """Valida pré-condições para o engine preciso."""
         if self.dados is None or len(self.dados) < 30:
             raise RuntimeError("Histórico insuficiente para geração precisa (mínimo 30 concursos).")
         for col in [f'B{i}' for i in range(1,16)]:
@@ -895,19 +933,20 @@ class BotLotofacil:
                 raise RuntimeError(f"Coluna obrigatória ausente no histórico: {col}")
 
     def _teste_engine_precisa_startup(self) -> bool:
-        """Tenta gerar 1 aposta para verificar saúde no start."""
         self._precheck_precisa()
         _ = self.gerar_aposta_precisa(n_apostas=1, seed=None)
         return True
 
+    # -------------------------
+    # Outras utilidades
+    # -------------------------
+    
     def gerar_aposta_precisa_com_retry(self, n_apostas: int, seed: Optional[int] = None, retries: int = 2) -> List[List[int]]:
-        """Wrapper resiliente com retries e contadores de falha."""
         last_exc: Optional[Exception] = None
         self._precheck_precisa()
         for tent in range(retries + 1):
             try:
                 resultado = self.gerar_aposta_precisa(n_apostas=n_apostas, seed=seed)
-                # sucesso: zera contador
                 self.precise_fail_count = 0
                 self.precise_enabled = True
                 self.precise_last_error = None
@@ -916,27 +955,22 @@ class BotLotofacil:
                 last_exc = e
                 self.precise_fail_count += 1
                 self.precise_last_error = str(e)
-                # pequeno backoff simples
                 try:
                     import time as _t
                     _t.sleep(0.2 * (tent + 1))
                 except Exception:
                     pass
 
-        # se chegou aqui, esgotou retries: marca como degradado
         self.precise_enabled = False
-        # opcional: alerta admin se houver muitas falhas seguidas
         if self.precise_fail_count >= 3:
             try:
                 for _admin in ADMIN_USER_IDS:
                     self._notificar_admin_falha_precisa(_admin)
             except Exception:
                 pass
-        # levanta a última exceção para o caller aplicar fallback
         raise last_exc or RuntimeError("Falha desconhecida no engine precisa.")
 
     def _notificar_admin_falha_precisa(self, admin_id: int) -> None:
-        """Mensagem simples de alerta ao admin (best-effort)."""
         try:
             logger.warning(f"[ADMIN ALERT] Falhas seguidas no engine precisa: {self.precise_fail_count} | Último erro: {self.precise_last_error}")
         except Exception:
@@ -1462,6 +1496,7 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
 
 
 
