@@ -596,6 +596,7 @@ class BotLotofacil:
             ap = sorted(ap)
             tent += 1
         return ap
+
     def _count_low_mid_high(self, ap: List[int]) -> Tuple[int, int, int]:
         """Conta quantos números caem nas faixas: low(1-8), mid(9-17), high(18-25)."""
         low = sum(1 for n in ap if 1 <= n <= 8)
@@ -634,22 +635,21 @@ class BotLotofacil:
         p_aplicar: float = 0.8,
     ) -> List[int]:
         """
-        Mutações pequenas guiadas pelo novo score (com _score_balance embutido).
-        - Só aceita troca se melhora o score ou piora muito pouco mas melhora diversidade/cobertura.
-        - Impõe limites soft de low/mid/high para evitar viés.
+        Mutações pequenas guiadas pelo score (inclui _score_balance).
+        Aceita troca se melhora o score ou piora pouco mas melhora cobertura.
+        Limites soft por faixa para evitar viés.
         """
         if rng.random() > p_aplicar:
             return sorted(aposta[:])
 
         base = sorted(aposta[:])
         score_orig = float(self.avaliar_aposta_ga(base)[0])
-        low0, mid0, high0 = self._count_low_mid_high(base)
 
-        # ordem de remoção: mais "pressionados" (muito frequentes no histórico + já cobertos)
+        # ordem de remoção: mais pressionados (freq histórica + já cobertos)
         pressao_remover = {n: self.frequencias.get(n, 0) + cobertura_execucao[n] for n in base}
         cand_remover = sorted(base, key=lambda n: (-pressao_remover[n], n))
 
-        # ordem de inclusão: preferência por números com menor frequência histórica
+        # ordem de inclusão: preferência por baixa frequência histórica + leve cooc
         fora = [n for n in range(1, 26) if n not in base]
         vant_incluir = {
             n: -self.frequencias.get(n, 0) + float(np.sum(self.coocorrencias[n-1, [x-1 for x in base]])) * 0.03
@@ -664,8 +664,7 @@ class BotLotofacil:
 
         def _ok_faixas(ap):
             low, mid, high = self._count_low_mid_high(ap)
-            # regras soft para segurar o viés:
-            if low > 8:   # não deixa estourar baixo
+            if low > 8:        # não deixa estourar baixo
                 return False
             if mid == 0 or high == 0:  # evita colapsar uma faixa
                 return False
@@ -680,27 +679,22 @@ class BotLotofacil:
             nova = [x for x in tentativa if x != sai] + [entra]
             nova.sort()
 
-            # regras básicas
+            # regras básicas e faixas
             if not self._valida_regras_basicas(nova):
                 continue
             if not _ok_faixas(nova):
                 continue
-
             # anti {1,2,3}
             if {1, 2, 3}.issubset(set(nova)):
                 continue
 
             score_novo = float(self.avaliar_aposta_ga(nova)[0])
 
-            # Diversidade/cobertura auxiliares
-            dist_bonus = 0.0
-            if tentativa:
-                dist_bonus = 0.0  # mantemos neutro aqui; a seleção final já considera bem a diversidade
-
+            # bônus de cobertura local
             cover_bonus = sum(1.0 / (1.0 + cobertura_execucao[n]) for n in nova) - \
                           sum(1.0 / (1.0 + cobertura_execucao[n]) for n in tentativa)
 
-            # aceita se melhora score ou se piora pouco mas melhora cobertura
+            # aceita se melhora score, ou piora pouco e melhora cobertura
             if (score_novo + tol_score >= score_orig) or (score_novo >= score_orig - tol_score and cover_bonus > 0.5):
                 tentativa = nova
                 score_orig = score_novo
@@ -756,96 +750,83 @@ class BotLotofacil:
 
     def avaliar_aposta_ga(self, aposta: List[int]) -> Tuple[float]:
         """
-        Avalia uma aposta com múltiplos critérios:
-        - Frequência normalizada (evita supervalorizar números 'baixinhos' só por volume histórico)
-        - Coocorrência leve (não domina o score)
-        - Clusters (leve bônus se espalha 2–4 por cluster)
-        - Balanceamento por faixas (low/mid/high) via _score_balance
-        - Regras de sanidade (pares, soma, runs)
-        - Antiviés: penaliza forte prefixo {1,2,3} e excesso de números baixos
-        Retorna (score_total,) para compatibilidade com DEAP.
+        Score multi-critérios (versão consolidada):
+        - Frequência (z-score)
+        - Coocorrência leve
+        - Clusters (bônus se 2–4 por cluster)
+        - Balanceamento por faixas (via _score_balance)
+        - Sanidade (pares, soma, runs)
+        - Antiviés: penaliza {1,2,3} e excesso de baixos
+        - Bônus de extremos e sequência inicial leve
         """
-        # Sanitização mínima
         aposta = sorted(set(int(n) for n in aposta if 1 <= int(n) <= 25))
         if len(aposta) != 15:
             return (0.0,)
 
         s_ap = set(aposta)
 
-        # ---------- 1) Frequência NORMALIZADA (z-score) ----------
-        # Evita que volumes absolutos do histórico puxem demais para baixo (1..12)
+        # 1) Frequência z-score
         freq_arr = np.array([self.frequencias.get(i, 0) for i in range(1, 26)], dtype=float)
         mu = float(freq_arr.mean())
         sd = float(freq_arr.std()) if float(freq_arr.std()) > 1e-9 else 1.0
-        zscores = (freq_arr - mu) / sd  # média 0, desvio 1
+        zscores = (freq_arr - mu) / sd
         score_freq = float(sum(zscores[n - 1] for n in aposta))
-        w_freq = 0.6  # peso moderado (antes era muito dominante)
+        w_freq = 0.6
 
-        # ---------- 2) Coocorrência LEVE ----------
-        # Mantemos contribuição baixa para não grudar combinações comuns do passado
+        # 2) Coocorrência leve
         score_cooc = 0.0
         for i in range(len(aposta)):
             for j in range(i + 1, len(aposta)):
                 score_cooc += float(self.coocorrencias[aposta[i] - 1, aposta[j] - 1])
-        w_cooc = 0.06  # bem menor que antes (0.1)
+        w_cooc = 0.06
 
-        # ---------- 3) Clusters ----------
+        # 3) Clusters
         score_cluster = 0.0
         for cluster_nums in self.clusters.values():
             inter = s_ap & set(cluster_nums)
             if 2 <= len(inter) <= 4:
-                score_cluster += 1.0  # reduzido; antes eram +10 por cluster
-        w_cluster = 2.0  # 2.0 * (até ~4) = até ~8 de bônus se distribuir bem
+                score_cluster += 1.0
+        w_cluster = 2.0
 
-        # ---------- 4) Balanceamento por faixas ----------
-        # Usa o helper novo para “puxar” ao 5-5-5 e punir excesso de low.
+        # 4) Balanceamento por faixas
         score_bal = self._score_balance(aposta)
-        w_bal = 1.8  # peso forte, é o principal antiviés
+        w_bal = 1.8
 
-        # ---------- 5) Regras de sanidade (pares, soma, runs) ----------
+        # 5) Sanidade
         pares = sum(1 for n in aposta if n % 2 == 0)
         soma = sum(aposta)
         penalty = 0.0
         if not (5 <= pares <= 10):
-            penalty += 8.0  # um pouco menor que 10 para não dominar
+            penalty += 8.0
         if not (160 <= soma <= 220):
             penalty += 8.0
-
-        # runs longas
         run_len = self._maior_sequencia_consecutivos(aposta)
         if run_len >= 4:
             penalty += (run_len - 3) * 4.0
 
-        # ---------- 6) Antiviés específico ----------
-        # 6.1) Prefixo 1-2-3 muito comum nas saídas: penaliza forte
+        # 6) Antiviés
         if {1, 2, 3}.issubset(s_ap):
-            penalty += 12.0  # antes -6; agora mais severo
-
-        # 6.2) Excesso de números baixos
+            penalty += 12.0
         low, mid, high = self._count_low_mid_high(aposta)
         if low >= 9:
-            penalty += (low - 8) * 3.0  # >8 baixos dói bastante
-        # Evita concentrações exageradas nos 1..5
+            penalty += (low - 8) * 3.0
         if sum(1 for n in aposta if 1 <= n <= 5) >= 4:
             penalty += 4.0
 
-        # ---------- 7) Pequeno incentivo a cobrir extremos ----------
-        bonus_extremos = 0.0
-        if any(n <= 3 for n in aposta) and any(n >= 23 for n in aposta):
-            bonus_extremos += 1.0  # pequeno bônus extra além do já previsto em _score_balance
+        # 7) Bônus de extremos
+        bonus_extremos = 1.0 if any(n <= 3 for n in aposta) and any(n >= 23 for n in aposta) else 0.0
 
-        # ---------- 8) Sequência inicial (muito leve) ----------
+        # 8) Sequência inicial leve
         seq_inicial = tuple(sorted(aposta)[:3])
-        score_seq = float(self.sequencias_iniciais.get(seq_inicial, 0)) * 0.1  # reduzir influência
+        score_seq = float(self.sequencias_iniciais.get(seq_inicial, 0)) * 0.1
 
-        # ---------- 9) Agregação ----------
+        # 9) Agregação
         score_total = (
             w_freq * score_freq +
             w_cooc * score_cooc +
             w_cluster * score_cluster +
             w_bal * score_bal +
-            score_seq +
-            bonus_extremos
+            score_seq + bonus_extremos
             - penalty
         )
         return (float(score_total),)
@@ -866,7 +847,6 @@ class BotLotofacil:
                 aposta_final = sorted(aposta_ga)
             apostas.append(aposta_final)
         return self.aplicar_fechamento(apostas)
-
 
     # -------------------------
     # Anti-viés / diversidade forte
@@ -946,22 +926,20 @@ class BotLotofacil:
         cobertura_execucao: Counter
     ) -> List[List[int]]:
         """
-        Versão reforçada:
-        - quebra prefixo {1,2,3} se aparecer
-        - aplica _enforce_final_constraints (low<=8 e extremos cobertos)
-        - impõe diversidade mínima contra as já escolhidas
+        Reforço final por diversidade e antiviés:
+        - quebra {1,2,3}
+        - aplica _enforce_final_constraints
+        - impõe diversidade mínima vs. já escolhidas
         - evita duplicatas globais
         """
         final: List[List[int]] = []
         vistos: Set[Tuple[int, ...]] = set()
 
         for ap in lote:
-            # quebra prefixo padrão
             ap = self._forca_quebra_123(ap, rng)
-            # reforço anti-viés + extremos
             ap = self._enforce_final_constraints(ap, rng)
 
-            # força diversidade contra o que já foi escolhido
+            # diversidade mínima
             tent = 0
             while final and (min(15 - len(set(ap) & set(e)) for e in final) < min_diff) and tent < 25:
                 ap = self._mutacao_suave(ap, rng, cobertura_execucao, max_trocas=3, tol_score=0.5, p_aplicar=0.8)
@@ -969,7 +947,7 @@ class BotLotofacil:
                 ap = self._enforce_final_constraints(ap, rng)
                 tent += 1
 
-            # evita duplicata global
+            # unicidade global
             tent = 0
             key = tuple(sorted(ap))
             while key in vistos and tent < 20:
@@ -1023,7 +1001,7 @@ class BotLotofacil:
         for i in range(n_alvo):
             cand_list: List[List[int]] = []
 
-            # 1) Engine precisa com seeds variados
+            # 1) Engine precisa (seeds variados)
             for t in range(4):
                 try:
                     geradas = gerar_apostas_precisas(
@@ -1045,13 +1023,13 @@ class BotLotofacil:
                 except Exception:
                     pass
 
-            # 4) Mutações em cima dos candidatos
+            # 4) Mutações (exploratório — aqui pode ser mais agressivo)
             base_for_mut = cand_list[:]
             for ap in base_for_mut:
                 cand_list.append(self._mutacao_suave(ap, rng_global, cobertura_execucao,
-                                                     max_trocas=2, tol_score=3.0, p_aplicar=1.0))
+                                                 max_trocas=2, tol_score=3.0, p_aplicar=1.0))
 
-            # 5) Reparo + filtros duros + pré-diversidade local
+            # 5) Reparo + filtros + pré-diversidade local
             candidatos_validos: List[List[int]] = []
             seen_local: Set[Tuple[int, ...]] = set()
             for ap in cand_list:
@@ -1079,31 +1057,25 @@ class BotLotofacil:
                     seen_local.add(key)
                     candidatos_validos.append(ap)
 
-            # 6) score leve + diversidade contra lote temporário
+            # 6) score leve + diversidade contra lote temporário  (INDENTAÇÃO CORRETA)
             def _score_total(ap: List[int]) -> float:
                 fit = float(self.avaliar_aposta_ga(ap)[0])  # já inclui balanceamento por faixas
-                # diversidade mínima contra o que já temos no lote
                 dist = 0.0 if not apostas_tmp else min(15 - len(set(ap) & set(e)) for e in apostas_tmp)
-                # cobertura de dezenas ainda não usadas nesta execução
                 cover = _ganho_cobertura(ap)
-
-                # penalidades adicionais (reforço do antiviés)
                 pen = 0.0
-                low, mid, high = self._count_low_mid_high(ap)
+                low, _, _ = self._count_low_mid_high(ap)
                 if low > 8:
                     pen += (low - 8) * 2.5
                 if {1, 2, 3}.issubset(set(ap)):
                     pen += 6.0
-
-                # pesos: damos prioridade a (fit) e (diversidade), cobertura ajuda desempate
                 return (fit * 1.0) + (dist * 2.5) + (cover * 0.9) - pen
 
             escolhido = max(candidatos_validos, key=_score_total)
-            # evita duplicata global
+
+            # evita duplicata global (uma única estratégia padronizada)
             tries = 0
             key = tuple(sorted(escolhido))
             while key in vistos and tries < 12:
-                # use os padrões da _mutacao_suave (max_trocas=3, tol_score=0.5, p_aplicar=0.8)
                 escolhido = self._mutacao_suave(escolhido, rng_global, cobertura_execucao)
                 escolhido = self._repara(escolhido, rng_global)
                 escolhido = self._forca_quebra_123(escolhido, rng_global)
@@ -1114,7 +1086,7 @@ class BotLotofacil:
             apostas_tmp.append(sorted(escolhido))
             cobertura_execucao.update(escolhido)
 
-        # 7) Cinturão final: quebra {1,2,3}, distância mínima e unicidade
+        # 7) Cinturão final
         apostas_final = self._forca_diversidade_lote(apostas_tmp, MIN_DIFF, rng_global, cobertura_execucao)
         self.ultima_geracao_precisa = [sorted(ap) for ap in apostas_final]
         return self.ultima_geracao_precisa
@@ -1137,7 +1109,6 @@ class BotLotofacil:
     # -------------------------
     # Outras utilidades
     # -------------------------
-    
     def gerar_aposta_precisa_com_retry(self, n_apostas: int, seed: Optional[int] = None, retries: int = 2) -> List[List[int]]:
         last_exc: Optional[Exception] = None
         self._precheck_precisa()
@@ -1169,22 +1140,24 @@ class BotLotofacil:
 
     def _notificar_admin_falha_precisa(self, admin_id: int) -> None:
         try:
-            logger.warning(f"[ADMIN ALERT] Falhas seguidas no engine precisa: {self.precise_fail_count} | Último erro: {self.precise_last_error}")
+            logger.warning(
+                f"[ADMIN ALERT] Falhas seguidas no engine precisa: {self.precise_fail_count} | "
+                f"Último erro: {self.precise_last_error}"
+            )
         except Exception:
             pass
 
     def combinar_apostas(self, aposta1: List[int], aposta2: List[int]) -> List[int]:
-        """Combina duas apostas de forma inteligente"""
+        """Combina duas apostas de forma inteligente."""
         comuns = set(aposta1) & set(aposta2)
         diferentes = list((set(aposta1) | set(aposta2)) - comuns)
         random.shuffle(diferentes)
-        
         nova_aposta = list(comuns) + diferentes[:15 - len(comuns)]
         return sorted(nova_aposta)
-    
+
     def aplicar_fechamento(self, apostas: List[List[int]]) -> List[List[int]]:
         """
-        Fecha cobertura global (1..25) sem reintroduzir viés:
+        Fecha cobertura global (1..25) sem viés:
         - adiciona números faltantes trocando de apostas com maior redundância
         - nunca deixa 'low' (1–8) estourar (>8)
         - preserva extremos (>=1 em 1–3 e >=1 em 23–25) dentro de cada aposta
@@ -1199,92 +1172,49 @@ class BotLotofacil:
             cobertura.update(ap)
 
         faltantes = [n for n in todos_numeros if cobertura[n] == 0]
-        if not faltantes:
-            # ainda reforça o anti-viés de cada aposta no final
-            rng_post = random.Random(sum(sum(ap) for ap in apostas) + 991)
-            return [self._enforce_final_constraints(ap[:], rng_post) for ap in apostas]
 
         # determinismo leve pra facilitar debug
         rng = random.Random(sum(sum(ap) for ap in apostas) + 349)
 
-        # função auxiliar para checar se a aposta mantém extremos após troca
         def _mantem_extremos(nums: List[int]) -> bool:
             return any(n <= 3 for n in nums) and any(n >= 23 for n in nums)
 
-        # ordenar apostas por “custo de abrir mão” (começa pelas piores: menor soma de frequência)
         def _score_aposta_para_troca(ap: List[int]) -> float:
-            # baixa soma de frequências -> mais “barata” pra alterar
             return sum(self.frequencias.get(n, 0) for n in ap)
 
         apostas_idx_ordenadas = sorted(range(len(apostas)), key=lambda i: _score_aposta_para_troca(apostas[i]))
 
-        for num_in in faltantes:
-            trocou = False
+        # Só entra no loop se de fato houver faltantes
+        if faltantes:
+            for num_in in faltantes:
+                trocou = False
 
-            for idx in apostas_idx_ordenadas:
-                ap = apostas[idx]
-                # candidatos a sair: onde há redundância (aparece mais de 1 vez no pool)
-                # e prioriza tirar os mais "comuns" e mais "redundantes"
-                cand_out = [n for n in ap if cobertura[n] > 1 and n != num_in]
-
-                if not cand_out:
-                    continue
-
-                # ordena candidatos que saem por pressão (freq alta + muita cobertura)
-                cand_out.sort(key=lambda n: (self.frequencias.get(n, 0), cobertura[n]), reverse=True)
-
-                for sai in cand_out:
-                    if num_in in ap:
-                        # já está nesta aposta (segue pra próxima aposta)
-                        break
-
-                    tentativa = sorted([x for x in ap if x != sai] + [num_in])
-
-                    # não perder extremos com a troca
-                    if not _mantem_extremos(tentativa):
-                        continue
-
-                    # respeitar o teto de low (1–8)
-                    low, mid, high = self._count_low_mid_high(tentativa)
-                    if low > 8:
-                        continue
-
-                    # repara regras básicas e reforça anti-viés/pareamento
-                    tentativa = self._repara(tentativa, rng)
-                    tentativa = self._enforce_final_constraints(tentativa, rng)
-
-                    # valida novamente (pode ter ajustado pares/soma etc.)
-                    if not self._valida_regras_basicas(tentativa):
-                        continue
-
-                    # aceita a troca
-                    # atualiza cobertura global
-                    cobertura[sai] -= 1
-                    cobertura[num_in] += 1
-                    apostas[idx] = sorted(tentativa)
-                    trocou = True
-                    break
-
-                if trocou:
-                    break
-
-            # fallback: se não conseguiu trocar mantendo tudo,
-            # tenta num “segundo passe” mais permissivo (ainda validando regras)
-            if not trocou:
                 for idx in apostas_idx_ordenadas:
                     ap = apostas[idx]
-                    # aqui permitimos tirar qualquer número que não seja o próprio num_in
-                    cand_out = [n for n in ap if n != num_in]
-                    rng.shuffle(cand_out)
+                    cand_out = [n for n in ap if cobertura[n] > 1 and n != num_in]
+                    if not cand_out:
+                        continue
+
+                    cand_out.sort(key=lambda n: (self.frequencias.get(n, 0), cobertura[n]), reverse=True)
 
                     for sai in cand_out:
+                        if num_in in ap:
+                            break
+
                         tentativa = sorted([x for x in ap if x != sai] + [num_in])
+
+                        if not _mantem_extremos(tentativa):
+                            continue
+
+                        low, _, _ = self._count_low_mid_high(tentativa)
+                        if low > 8:
+                            continue
+
                         tentativa = self._repara(tentativa, rng)
                         tentativa = self._enforce_final_constraints(tentativa, rng)
                         if not self._valida_regras_basicas(tentativa):
                             continue
 
-                        # aceita e atualiza cobertura
                         cobertura[sai] -= 1
                         cobertura[num_in] += 1
                         apostas[idx] = sorted(tentativa)
@@ -1294,21 +1224,43 @@ class BotLotofacil:
                     if trocou:
                         break
 
-        # pós-fechamento: reforça anti-viés em todas
+                # fallback permissivo (mantendo sanidade)
+                if not trocou:
+                    for idx in apostas_idx_ordenadas:
+                        ap = apostas[idx]
+                        cand_out = [n for n in ap if n != num_in]
+                        rng.shuffle(cand_out)
+
+                        for sai in cand_out:
+                            tentativa = sorted([x for x in ap if x != sai] + [num_in])
+                            tentativa = self._repara(tentativa, rng)
+                            tentativa = self._enforce_final_constraints(tentativa, rng)
+                            if not self._valida_regras_basicas(tentativa):
+                                continue
+
+                            cobertura[sai] -= 1
+                            cobertura[num_in] += 1
+                            apostas[idx] = sorted(tentativa)
+                            trocou = True
+                            break
+
+                        if trocou:
+                            break
+
+        # reforço anti-viés para TODAS as apostas, mesmo sem faltantes
         rng_post = random.Random(sum(sum(ap) for ap in apostas) + 199)
         apostas = [self._enforce_final_constraints(ap[:], rng_post) for ap in apostas]
-
         return apostas
 
     def verificar_clusters(self, aposta: List[int]) -> Dict[int, int]:
-        """Retorna distribuição da aposta pelos clusters"""
+        """Retorna distribuição da aposta pelos clusters."""
         dist = {}
         for cluster, nums in self.clusters.items():
             dist[cluster] = len(set(aposta) & set(nums))
         return dist
-    
+
     def gerar_grafico_frequencia(self) -> BytesIO:
-        """Gera gráfico de frequência dos números"""
+        """Gera gráfico de frequência dos números."""
         plt.figure(figsize=(10, 5))
         nums, freqs = zip(*sorted(self.frequencias.items()))
         plt.bar(nums, freqs)
@@ -1317,15 +1269,15 @@ class BotLotofacil:
         plt.ylabel('Frequência')
         plt.xticks(range(1, 26))
         plt.grid(axis='y', linestyle='--', alpha=0.7)
-        
+
         buf = BytesIO()
         plt.savefig(buf, format='png')
         buf.seek(0)
         plt.close()
         return buf
-    
+
     def gerar_aposta_tendencia(self, hot_numbers: int = 8, cold_numbers: int = 7) -> List[int]:
-        """Gera aposta baseada em números quentes e frios"""
+        """Gera aposta baseada em números quentes e frios."""
         # Números quentes (mais sorteados nos últimos 10 concursos)
         last_10 = self.dados.tail(10)
         hot_nums = Counter()
@@ -1334,7 +1286,6 @@ class BotLotofacil:
         hot_pool = [num for num, _ in hot_nums.most_common(hot_numbers)]
 
         # Números frios (não sorteados há mais de 15 concursos)
-        cold_pool = []
         all_drawn = set()
         for _, row in self.dados.tail(15).iterrows():
             all_drawn.update(row[[f'B{i}' for i in range(1,16)]].values)
@@ -1343,11 +1294,15 @@ class BotLotofacil:
         # Preenche o restante aleatoriamente
         remaining = 15 - len(hot_pool) - len(cold_pool)
         middle_pool = [n for n in range(1, 26) if n not in hot_pool and n not in cold_pool]
-        selected = hot_pool + cold_pool + random.sample(middle_pool, remaining)
-        
+        selected = hot_pool + cold_pool + random.sample(middle_pool, max(0, remaining))
         return sorted(selected)
 
-# Inicializa o bot
+
+# =========================
+# Bloco 4 — Telegram (handlers)
+# =========================
+
+# Instância principal do bot
 bot = BotLotofacil()
 
 def apenas_admin(func):
@@ -1372,14 +1327,10 @@ def somente_autorizado(func):
         except Exception as e:
             logger.error(f"Erro inesperado: {str(e)}")
             update.message.reply_text("❌ Ocorreu um erro inesperado. Tente novamente.")
-    return wrapper  
+    return wrapper
 
-# Handlers do Telegram
 def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text(
-        AVISO_LEGAL,
-        parse_mode='HTML'
-    )
+    update.message.reply_text(AVISO_LEGAL, parse_mode='HTML')
     update.message.reply_text(
         "🎰 Bot da Lotofácil IA 🎰\n\n"
         "Comandos disponíveis:\n"
@@ -1404,7 +1355,6 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
     progress_msg = None
     progress_job = None
     try:
-        # --- INICIA A BARRA ---
         chat_id = update.effective_chat.id
         progress_msg, progress_job = _start_progress(context, chat_id)
 
@@ -1419,11 +1369,9 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
             apostas = bot.gerar_aposta(n_apostas)
             engine_label = "clássico (fallback)"
 
-        # --- PARA A BARRA COM SUCESSO ---
         if progress_job and progress_msg:
             _stop_progress(progress_job, progress_msg, "✅ <b>Geração concluída.</b>")
 
-        # Envia o resultado
         mensagem = f"🎲 Apostas recomendadas — engine: {engine_label} 🎲\n\n"
         for i, aposta in enumerate(apostas, 1):
             pares = sum(1 for n in aposta if n % 2 == 0)
@@ -1436,7 +1384,6 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
 
     except Exception as e:
         logger.error(f"Erro ao gerar apostas: {str(e)}")
-        # --- PARA A BARRA COM ERRO ---
         if progress_job and progress_msg:
             _stop_progress(progress_job, progress_msg, "❌ <b>Falha na geração.</b>")
         update.message.reply_text("❌ Ocorreu um erro ao gerar as apostas. Tente novamente.")
@@ -1476,7 +1423,7 @@ def comando_analise(update: Update, context: CallbackContext) -> None:
         grafico = bot.gerar_grafico_frequencia()
         update.message.reply_photo(photo=InputFile(grafico), caption='Frequência dos números na Lotofácil')
 
-        # Frequência de todos os números de 1 a 25 (zero incluído)
+        # Frequência completa 1..25
         freq_completa = [(n, bot.frequencias.get(n, 0)) for n in range(1, 26)]
         freq_ordenada = sorted(freq_completa, key=lambda x: (x[1], x[0]))
         menos_frequentes = [str(n) for n, _ in freq_ordenada[:5]]
@@ -1568,7 +1515,10 @@ def comando_inserir(update, context):
         return
     try:
         if not context.args or len(context.args) != 16:
-            update.message.reply_text("❌ Uso correto: /inserir YYYY-MM-DD D1 D2 ... D15\nExemplo: /inserir 2025-08-08 01 03 05 07 09 10 12 14 17 18 19 20 22 23 25")
+            update.message.reply_text(
+                "❌ Uso correto: /inserir YYYY-MM-DD D1 D2 ... D15\n"
+                "Exemplo: /inserir 2025-08-08 01 03 05 07 09 10 12 14 17 18 19 20 22 23 25"
+            )
             return
         data = context.args[0]
         dezenas = context.args[1:]
@@ -1586,15 +1536,12 @@ def comando_inserir(update, context):
             update.message.reply_text("❌ Data inválida. Utilize o formato YYYY-MM-DD.")
             return
 
-        # ------------------------------------------------------------------
-        # ⚠️ SUGESTÃO (opcional): validar duplicidade de data antes de inserir
-        # Não remove nada do fluxo original; apenas evita inserir se já existir.
+        # valida duplicidade de data
         try:
             data_dt = pd.to_datetime(data, format="%Y-%m-%d", errors="raise")
         except Exception:
             update.message.reply_text("❌ Data inválida ao normalizar. Utilize o formato YYYY-MM-DD.")
             return
-        # ------------------------------------------------------------------
 
         arq = 'lotofacil_historico.csv'
         if not os.path.exists(arq):
@@ -1602,8 +1549,7 @@ def comando_inserir(update, context):
             return
         df = pd.read_csv(arq)
 
-        # ------------------------------------------------------------------
-        # ⚠️ SUGESTÃO (opcional): checar se já existe concurso com a MESMA data
+        # checa data já existente
         try:
             if 'data' in df.columns and not df.empty:
                 df_datas = pd.to_datetime(df['data'], format="%Y-%m-%d", errors="coerce")
@@ -1613,21 +1559,16 @@ def comando_inserir(update, context):
                 if (df_datas.dt.date == data_dt.date()).any():
                     update.message.reply_text(
                         "⚠️ Já existe um concurso com esta data no histórico.\n"
-                        "Para evitar duplicidade, a inserção foi cancelada.\n"
-                        "Se for realmente um novo registro da mesma data, ajuste a data ou edite o CSV manualmente."
+                        "Para evitar duplicidade, a inserção foi cancelada."
                     )
                     return
         except Exception:
-            # Se algo der errado, não bloqueia a operação; apenas segue.
             pass
-        # ------------------------------------------------------------------
 
-        # ------------------------------------------------------------------
-        # ✅ (opcional) Bloquear inserção se as 15 dezenas já existirem em algum concurso
+        # bloqueia inserção se combinação de 15 dezenas já existe
         try:
             if not df.empty:
                 alvo = frozenset(int(x) for x in dezenas_int)
-                # percorre apenas colunas B1..B15 se existirem
                 cols_b = [f'B{i}' for i in range(1, 16) if f'B{i}' in df.columns]
                 if len(cols_b) == 15:
                     repetida = False
@@ -1638,20 +1579,17 @@ def comando_inserir(update, context):
                                 repetida = True
                                 break
                         except Exception:
-                            # se alguma linha estiver suja, ignora e continua
                             continue
                     if repetida:
                         update.message.reply_text(
                             "⚠️ Já existe um concurso com exatamente as mesmas 15 dezenas.\n"
-                            "A inserção foi cancelada para evitar duplicidade de combinação."
+                            "A inserção foi cancelada."
                         )
                         return
         except Exception:
-            # Qualquer falha aqui não impede a inserção; é check opcional.
             pass
-        # ------------------------------------------------------------------
 
-        # Próximo número seguro mesmo com CSV vazio ou 'numero' nulo
+        # próximo número seguro
         if 'numero' in df.columns and not df['numero'].dropna().empty:
             try:
                 max_num = pd.to_numeric(df['numero'], errors='coerce').max()
@@ -1669,7 +1607,7 @@ def comando_inserir(update, context):
 
         df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
 
-        # Recalcula campos de repetidos corretamente
+        # recalcula campos de repetidos
         for rep in range(1, 6):
             repetidos = []
             for idx, row in df.iterrows():
@@ -1682,18 +1620,18 @@ def comando_inserir(update, context):
             df[f'repetidos_{rep}'] = repetidos
 
         df = df.sort_values('numero').reset_index(drop=True)
-        backup_csv()  # Faz backup automático antes de salvar o CSV final
+        backup_csv()
         df.to_csv(arq, index=False, encoding='utf-8')
 
         update.message.reply_text(
-            f"✅ Resultado inserido com sucesso!\nConcurso: {proximo_numero}\nData: {data}\nDezenas: {' '.join(str(d).zfill(2) for d in dezenas_int)}"
+            f"✅ Resultado inserido com sucesso!\nConcurso: {proximo_numero}\nData: {data}\n"
+            f"Dezenas: {' '.join(str(d).zfill(2) for d in dezenas_int)}"
         )
     except Exception as e:
         logger.error(f"Erro ao inserir resultado: {str(e)}")
         update.message.reply_text("❌ Falha ao inserir o resultado. Tente novamente.")
 
 def comando_meuid(update: Update, context: CallbackContext) -> None:
-    """Handler para comando /meuid (aberto para todos)"""
     user_id = update.effective_user.id
     update.message.reply_text(
         f"Seu ID do Telegram é: <b>{user_id}</b>\n\n"
@@ -1718,12 +1656,8 @@ def comando_autorizar(update: Update, context: CallbackContext) -> None:
             f.write(f"{user_id}\n")
         bot.security.whitelist.add(user_id)
         update.message.reply_text(f"✅ Usuário {user_id} autorizado com sucesso.")
-        # Envia o manual do usuário automaticamente
-        context.bot.send_message(
-            chat_id=user_id,
-            text=MANUAL_USUARIO,
-            parse_mode='HTML'
-        )
+        # envia o manual automaticamente
+        context.bot.send_message(chat_id=user_id, text=MANUAL_USUARIO, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Erro ao autorizar usuário: {str(e)}")
         update.message.reply_text("❌ Erro ao autorizar usuário.")
@@ -1758,7 +1692,7 @@ def error_handler(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("❌ Ocorreu um erro inesperado. Os administradores foram notificados.")
 
 def main() -> None:
-    """Função principal para iniciar o bot"""
+    """Função principal para iniciar o bot."""
     try:
         updater = Updater(TOKEN)
         dp = updater.dispatcher
@@ -1783,18 +1717,5 @@ def main() -> None:
         logger.error(f"Erro fatal ao iniciar o bot: {str(e)}")
 
 if __name__ == "__main__":
-
     main()
-
-
-
-
-
-
-
-
-
-
-
-
 
