@@ -16,7 +16,7 @@ import logging
 import warnings
 from typing import Optional, Dict, List, Tuple, Set
 
-# ---- Logging precisa estar antes de qualquer uso de logger ----
+# ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
 logging.basicConfig(
     format='{"time": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
@@ -45,7 +45,7 @@ import matplotlib.pyplot as plt
 import telegram
 from telegram import Update, InputFile
 from telegram.ext import Updater, CommandHandler, CallbackContext
-from telegram.utils.request import Request  # <<< necessário no v13
+from telegram.utils.request import Request  # v13.x
 
 # Núcleo preciso (score + GRASP + diversidade)
 from apostas_engine import gerar_apostas as gerar_apostas_precisas
@@ -1338,16 +1338,16 @@ def apenas_admin(func):
             update.message.reply_text("❌ Erro interno. Tente novamente mais tarde.")
     return wrapper
 
-def apenas_admin(func):
+def somente_autorizado(func):
     def wrapper(update, context):
         try:
-            if not bot.security.is_admin(update.effective_user.id):
-                update.message.reply_text("❌ Comando restrito ao administrador.")
+            if not bot.security.is_authorized(update.effective_user.id):
+                update.message.reply_text("❌ Você não tem permissão para usar este bot.")
                 return
             return func(update, context)
         except Exception as e:
-            logger.error(f"Erro inesperado em comando admin: {str(e)}")
-            update.message.reply_text("❌ Erro interno. Tente novamente mais tarde.")
+            logger.error(f"Erro inesperado: {str(e)}")
+            update.message.reply_text("❌ Ocorreu um erro inesperado. Tente novamente.")
     return wrapper
 
 def start(update: Update, context: CallbackContext) -> None:
@@ -1370,7 +1370,7 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
     if not rate_limit(update, "aposta"):
         return
 
-    success_flag = False  # <<< usado para fechar barra de progresso corretamente
+    success_flag = False
     progress_msg, progress_job = None, None
 
     try:
@@ -1443,7 +1443,7 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
         if progress_msg:
             final_text = "✅ <b>Geração concluída.</b>" if success_flag else "❌ <b>Falha na geração.</b>"
             _stop_progress(progress_job, progress_msg, final_text)
-
+            
 @somente_autorizado
 def comando_tendencia(update: Update, context: CallbackContext) -> None:
     if not rate_limit(update, "tendencia"):
@@ -1739,7 +1739,7 @@ def comando_remover(update: Update, context: CallbackContext) -> None:
     except Exception as e:
         logger.error(f"Erro ao remover usuário: {str(e)}")
         update.message.reply_text("❌ Erro ao remover usuário.")
-
+        
 def error_handler(update: Update, context: CallbackContext) -> None:
     """Tratamento robusto de erros, incluindo timeouts."""
     error = context.error
@@ -1808,7 +1808,7 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
 def main() -> None:
     """Função principal para iniciar o bot com tratamento robusto de erros."""
     try:
-        # <<< Construção explícita do Request compatível com v13.x
+        # Construção explícita do Request compatível com v13.x
         request = Request(
             con_pool_size=REQUEST_KWARGS["con_pool_size"],
             connect_timeout=REQUEST_KWARGS["connect_timeout"],
@@ -1817,7 +1817,7 @@ def main() -> None:
 
         updater = Updater(
             token=TOKEN,
-            request=request,          # <<< em vez de request_kwargs
+            request=request,          # em vez de request_kwargs
             use_context=True,
             workers=4
         )
@@ -1887,7 +1887,8 @@ if __name__ == "__main__":
         sys.exit(0)
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
-        raise  raise
+        raise  # <<< APENAS 'raise', sem duplicar
+
 
 
 
