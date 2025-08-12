@@ -22,9 +22,13 @@ import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
 from deap import base, creator, tools, algorithms
-import tensorflow as tf
+try:
+    import tensorflow as tf
+except ImportError:
+    logger.critical("TensorFlow não instalado!")
+    raise
 
-# Matplotlib
+# Matplotlib: backend seguro para servidor/headless
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -34,7 +38,7 @@ import telegram
 from telegram import Update, InputFile
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# Núcleo preciso
+# Núcleo preciso (score + GRASP + diversidade)
 from apostas_engine import gerar_apostas as gerar_apostas_precisas
 from apostas_engine import Config as ApostaConfig
 
@@ -44,9 +48,9 @@ import time
 
 # Configuração do timeout global para o bot
 REQUEST_KWARGS = {
-    'connect_timeout': 10,  # Tempo máximo para estabelecer conexão
-    'read_timeout': 20,     # Tempo máximo para receber resposta
-    'pool_timeout': 10      # Tempo máximo para obter conexão do pool
+    'connect_timeout': 10,
+    'read_timeout': int(os.getenv('TELEGRAM_TIMEOUT', 20)),
+    'pool_timeout': 10
 }
 
 _PROGRESS_FRAMES = ["▁","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃"]
@@ -1411,7 +1415,7 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
                     )
                 
                 safe_send_message(context, chat_id, mensagem)
-                logger.info(f"Mensagem com {n_apostas} apostas enviada com sucesso")
+                logger.info(f"Apostas geradas: {n_apostas}")
 
             except Exception as e_msg:
                 logger.error(f"Erro ao formatar mensagem: {str(e_msg)}")
@@ -1431,7 +1435,9 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
 
         finally:
             # Garante que a barra de progresso seja sempre finalizada
-            if progress_job or progress_msg:
+            if progress_job:
+                progress_job.schedule_removal()
+            if progress_msg:
                 try:
                     final_text = (
                         "✅ <b>Geração concluída.</b>" 
