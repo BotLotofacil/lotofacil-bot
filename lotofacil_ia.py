@@ -1002,7 +1002,7 @@ class BotLotofacil:
                         historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
                     )
                     if geradas:
-                        cand_list.append(sorted(set(map(int, geradas[0]))[:15])
+                        cand_list.append(sorted(set(map(int, geradas[0])))[:15])
                 except Exception:
                     pass
 
@@ -1712,3 +1712,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
