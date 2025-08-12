@@ -22,12 +22,10 @@ from sklearn.cluster import KMeans
 from deap import base, creator, tools, algorithms
 import tensorflow as tf
 
-# Matplotlib: backend seguro para servidor/headless (defina ANTES do pyplot)
+# Matplotlib: backend seguro para servidor/headless
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-# (opcional) seaborn não é usado; mantenha descomentado só se for usar de fato
-# import seaborn as sns
 
 # Telegram
 from telegram import Update, InputFile
@@ -50,14 +48,12 @@ def _progress_tick(context):
     frame = _PROGRESS_FRAMES[i % len(_PROGRESS_FRAMES)]
     elapsed = int(_now() - t0)
     try:
-        # Indeterminada: repetimos o mesmo char para parecer “barra”
         bar = frame * 20
         msg.edit_text(
             f"⏳ <b>Gerando apostas...</b>\n{bar}\n<i>{elapsed}s</i>",
             parse_mode='HTML'
         )
     except Exception:
-        # ignora erros de edição (mensagem apagada, etc.)
         pass
     data["i"] = i + 1
 
@@ -66,7 +62,7 @@ def _start_progress(context, chat_id):
     msg = context.bot.send_message(chat_id, "⏳ Iniciando geração...", parse_mode='HTML')
     job = context.job_queue.run_repeating(
         _progress_tick,
-        interval=0.7,           # atualiza a cada ~700ms
+        interval=0.7,
         first=0.0,
         context={"msg": msg, "i": 0, "t0": _now()}
     )
@@ -153,7 +149,7 @@ if DATA_DIR:
             except Exception as e:
                 logger.warning(f"Não foi possível copiar {src} -> {dst}: {e}")
 
-    # Remove modelo legado .h5 se existir no volume para evitar confusão
+    # Remove modelo legado .h5 se existir no volume
     try:
         old_h5 = os.path.join(DATA_DIR, "modelo_lotofacil_avancado.h5")
         if os.path.exists(old_h5):
@@ -167,7 +163,6 @@ if DATA_DIR:
     except Exception as e:
         logger.warning(f"Falha ao trocar para DATA_DIR ({DATA_DIR}): {e}")
 
-
 # Admins e rate-limit
 ADMIN_USER_IDS: List[int] = [5344714174]  # ajuste conforme necessário
 
@@ -179,7 +174,7 @@ def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
     Retorna False se deve bloquear a execução (muito cedo); True caso possa prosseguir.
     """
     user_id = update.effective_user.id
-    agora = _now()  # <- usa o alias único
+    agora = _now()
     user_map = _rate_limit_map.setdefault(user_id, {})
     ultimo = user_map.get(comando, 0.0)
     if agora - ultimo < segundos:
@@ -213,7 +208,6 @@ class SecurityManager:
                         if line.strip().isdigit()
                     }
             else:
-                # cria arquivo vazio se não existir (idempotente)
                 open(file, "a", encoding="utf-8").close()
         except Exception as e:
             logger.error(f"Erro ao carregar whitelist: {e}")
@@ -292,7 +286,7 @@ class BotLotofacil:
         self.precise_fail_count: int = 0
         self.precise_last_error: Optional[str] = None
 
-        # Autoteste simples no startup: se falhar, mantém enabled=False e registra motivo
+        # Autoteste simples no startup
         try:
             _ = self._teste_engine_precisa_startup()
             self.precise_enabled = True
@@ -1008,7 +1002,7 @@ class BotLotofacil:
                         historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
                     )
                     if geradas:
-                        cand_list.append(sorted(set(map(int, geradas[0])))[:15])
+                        cand_list.append(sorted(set(map(int, geradas[0]))[:15])
                 except Exception:
                     pass
 
@@ -1057,7 +1051,7 @@ class BotLotofacil:
                     seen_local.add(key)
                     candidatos_validos.append(ap)
 
-            # 6) score leve + diversidade contra lote temporário  (INDENTAÇÃO CORRETA)
+            # 6) score leve + diversidade contra lote temporário
             def _score_total(ap: List[int]) -> float:
                 fit = float(self.avaliar_aposta_ga(ap)[0])  # já inclui balanceamento por faixas
                 dist = 0.0 if not apostas_tmp else min(15 - len(set(ap) & set(e)) for e in apostas_tmp)
@@ -1718,4 +1712,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
