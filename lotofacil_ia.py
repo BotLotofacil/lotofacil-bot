@@ -104,7 +104,6 @@ def _stop_progress(job, msg, final_text):
     except Exception:
         pass
 
-
 # ==== fim helpers ====
 
 # ================================
@@ -1888,6 +1887,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise  # <<< APENAS 'raise', sem duplicar
+
 
 
 
