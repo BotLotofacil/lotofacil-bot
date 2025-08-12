@@ -43,6 +43,7 @@ import matplotlib.pyplot as plt
 
 # Telegram
 import telegram
+print("PTB version:", telegram.__version__)
 from telegram import Update, InputFile
 from telegram.ext import Updater, CommandHandler, CallbackContext
 from telegram.utils.request import Request  # v13.x
@@ -1807,17 +1808,11 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
 def main() -> None:
     """Função principal para iniciar o bot com tratamento robusto de erros."""
     try:
-        # Construção explícita do Request compatível com v13.x
-        request = Request(
-            con_pool_size=REQUEST_KWARGS["con_pool_size"],
-            connect_timeout=REQUEST_KWARGS["connect_timeout"],
-            read_timeout=REQUEST_KWARGS["read_timeout"],
-        )
-
+        # Versão corrigida da inicialização do Updater
         updater = Updater(
             token=TOKEN,
-            request=request,          # em vez de request_kwargs
             use_context=True,
+            request_kwargs=REQUEST_KWARGS,  # Passamos o dicionário de configurações diretamente
             workers=4
         )
 
@@ -1887,6 +1882,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise  # <<< APENAS 'raise', sem duplicar
+
 
 
 
