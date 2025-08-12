@@ -24,24 +24,23 @@ from sklearn.cluster import KMeans
 from deap import base, creator, tools, algorithms
 import tensorflow as tf
 
-# Matplotlib: backend seguro para servidor/headless
+# Matplotlib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # Telegram
+import telegram
 from telegram import Update, InputFile
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# Núcleo preciso (score + GRASP + diversidade)
+# Núcleo preciso
 from apostas_engine import gerar_apostas as gerar_apostas_precisas
 from apostas_engine import Config as ApostaConfig
 
 # ==== Barra de carregamento para /aposta (JobQueue) ====
 from time import time as _now
-
-# ==== Barra de carregamento para /aposta (JobQueue) ====
-import telegram  # Adicionado para tratamento específico de erros
+import time
 
 # Configuração do timeout global para o bot
 REQUEST_KWARGS = {
@@ -90,7 +89,7 @@ def _stop_progress(job, msg, final_text):
         msg.edit_text(final_text, parse_mode='HTML')
     except Exception:
         pass
-        
+
 # ==== fim helpers ====
 
 # ================================
@@ -1359,66 +1358,92 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
     try:
         chat_id = update.effective_chat.id
         
-        # Verificação inicial com safe_send_message
+        # Verificação inicial com tratamento de erro
         if bot.dados is None or len(bot.dados) == 0:
-            safe_send_message(
-                context,
-                chat_id,
-                "❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados."
-            )
+            try:
+                safe_send_message(
+                    context,
+                    chat_id,
+                    "❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados."
+                )
+            except Exception as e:
+                logger.error(f"Falha ao notificar dados indisponíveis: {str(e)}")
             return
 
         progress_msg, progress_job = None, None
         
         try:
+            # Inicia barra de progresso com timeout estendido
             progress_msg, progress_job = _start_progress(context, chat_id)
-            context.bot_data['timeout'] = 30  # Timeout aumentado para geração
+            context.bot_data['timeout'] = 30
 
+            # Processa número de apostas com validação
             n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
             n_apostas = max(1, min(n_apostas, 10))
 
-            # Geração com fallback automático
+            # Geração com fallback automático e logging
             try:
-                apostas = bot.gerar_aposta_precisa_com_retry(n_apostas=n_apostas, seed=None, retries=2)
+                apostas = bot.gerar_aposta_precisa_com_retry(
+                    n_apostas=n_apostas,
+                    seed=None,
+                    retries=2
+                )
                 engine_label = "precisa"
+                logger.info(f"Geração precisa concluída para {n_apostas} apostas")
             except Exception as e_precisa:
                 logger.warning(f"Falha no gerador preciso: {str(e_precisa)}")
                 apostas = bot.gerar_aposta(n_apostas)
                 engine_label = "clássico"
+                logger.info(f"Usando fallback clássico para {n_apostas} apostas")
 
-            # Construção e envio da mensagem
-            mensagem = f"🎲 Apostas recomendadas — engine: {engine_label} 🎲\n\n"
-            for i, aposta in enumerate(apostas, 1):
-                pares = sum(1 for n in aposta if n % 2 == 0)
-                soma = sum(aposta)
-                mensagem += (
-                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
-                    f"Pares: {pares} | Ímpares: {15-pares} | Soma: {soma}\n\n"
-                )
-            
-            safe_send_message(context, chat_id, mensagem)
+            # Construção segura da mensagem de resultado
+            try:
+                mensagem = f"🎲 Apostas recomendadas — engine: {engine_label} 🎲\n\n"
+                for i, aposta in enumerate(apostas, 1):
+                    if not isinstance(aposta, list) or len(aposta) != 15:
+                        raise ValueError("Formato de aposta inválido")
+                    
+                    pares = sum(1 for n in aposta if n % 2 == 0)
+                    soma = sum(aposta)
+                    mensagem += (
+                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in sorted(aposta))}\n"
+                        f"Pares: {pares} | Ímpares: {15-pares} | Soma: {soma}\n\n"
+                    )
+                
+                safe_send_message(context, chat_id, mensagem)
+                logger.info(f"Mensagem com {n_apostas} apostas enviada com sucesso")
+
+            except Exception as e_msg:
+                logger.error(f"Erro ao formatar mensagem: {str(e_msg)}")
+                raise
 
         except Exception as e:
             logger.error(f"Erro durante geração de apostas: {str(e)}")
-            safe_send_message(
-                context,
-                chat_id,
-                "⚠️ Falha durante a geração. Por favor, tente novamente mais tarde."
-            )
-            raise  # Re-lança para ser capturado pelo error_handler
+            try:
+                safe_send_message(
+                    context,
+                    chat_id,
+                    "⚠️ Falha durante a geração. Por favor, tente novamente mais tarde."
+                )
+            except Exception as e_send:
+                logger.error(f"Falha ao enviar mensagem de erro: {str(e_send)}")
+            raise  # Re-lança para captura pelo error_handler
 
         finally:
-            if progress_job and progress_msg:
+            # Garante que a barra de progresso seja sempre finalizada
+            if progress_job or progress_msg:
                 try:
-                    _stop_progress(progress_job, progress_msg, 
-                        "✅ <b>Geração concluída.</b>" if not isinstance(e, Exception) else 
-                        "❌ <b>Falha na geração.</b>")
+                    final_text = (
+                        "✅ <b>Geração concluída.</b>" 
+                        if 'e' not in locals() or not isinstance(e, Exception)
+                        else "❌ <b>Falha na geração.</b>"
+                    )
+                    _stop_progress(progress_job, progress_msg, final_text)
                 except Exception as e_stop:
-                    logger.error(f"Erro ao parar progresso: {str(e_stop)}")
+                    logger.error(f"Erro ao finalizar progresso: {str(e_stop)}")
 
     except Exception as e:
-        logger.error(f"Erro no comando_aposta: {str(e)}")
-        # O error_handler global já captura e trata
+        logger.error(f"Erro no comando_aposta: {str(e)}", exc_info=True)
 
 @somente_autorizado
 def comando_tendencia(update: Update, context: CallbackContext) -> None:
@@ -1721,11 +1746,10 @@ def comando_remover(update: Update, context: CallbackContext) -> None:
 def error_handler(update: Update, context: CallbackContext) -> None:
     """Tratamento robusto de erros, incluindo timeouts."""
     error = context.error
-    logger.error(f"Erro no bot: {str(error)}", exc_info=True)  # Log com stacktrace
+    logger.error(f"Erro no bot: {str(error)}", exc_info=True)
     
     try:
         if isinstance(error, telegram.error.TimedOut):
-            # Tentativa de reenvio com timeout maior
             try:
                 if update and update.message:
                     safe_send_message(
@@ -1769,7 +1793,7 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
                 chat_id=chat_id,
                 text=text,
                 parse_mode=parse_mode,
-                timeout=base_timeout * (attempt + 1),  # Timeout progressivo
+                timeout=base_timeout * (attempt + 1),
                 **kwargs
             )
             return
@@ -1782,7 +1806,7 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
             logger.warning(f"Problema de rede ao enviar mensagem (tentativa {attempt + 1}): {str(e)}")
             if attempt == max_retries - 1:
                 raise
-            time.sleep(2 ** attempt)  # Pausa exponencial entre tentativas
+            time.sleep(2 ** attempt)
         except Exception as e:
             logger.error(f"Erro inesperado ao enviar mensagem: {str(e)}")
             raise
@@ -1790,17 +1814,15 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
 def main() -> None:
     """Função principal para iniciar o bot com tratamento robusto de erros."""
     try:
-        # Configuração avançada do Updater com timeouts personalizados
         updater = Updater(
             TOKEN,
             request_kwargs=REQUEST_KWARGS,
             use_context=True,
-            workers=4  # Número de threads para processamento paralelo
+            workers=4
         )
         
         dp = updater.dispatcher
         
-        # Registro de handlers de comandos
         handlers = [
             CommandHandler("start", start),
             CommandHandler("meuid", comando_meuid),
@@ -1817,21 +1839,19 @@ def main() -> None:
         for handler in handlers:
             dp.add_handler(handler)
         
-        # Configuração do handler de erros global
         dp.add_error_handler(error_handler)
         
-        # Inicialização segura do bot
         logger.info("Iniciando bot com configurações otimizadas...")
         updater.start_polling(
-            poll_interval=0.5,  # Tempo entre verificações de atualizações
-            timeout=15,         # Timeout para polling
-            drop_pending_updates=True  # Ignora atualizações pendentes ao iniciar
+            poll_interval=0.5,
+            timeout=15,
+            drop_pending_updates=True
         )
         
         logger.info("✅ Bot iniciado com sucesso e aguardando comandos")
         logger.info(f"Configurações de timeout: {REQUEST_KWARGS}")
         
-        updater.idle()  # Mantém o bot em execução
+        updater.idle()
         
     except telegram.error.NetworkError as e:
         logger.critical(f"ERRO DE REDE: Não foi possível conectar ao Telegram: {str(e)}")
@@ -1855,7 +1875,6 @@ def main() -> None:
         raise SystemExit(1) from e
 
 if __name__ == "__main__":
-    # Configuração adicional para garantir a execução segura
     try:
         main()
     except KeyboardInterrupt:
@@ -1864,6 +1883,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
