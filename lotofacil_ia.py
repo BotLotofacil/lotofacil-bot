@@ -19,6 +19,14 @@ from typing import Optional, Dict, List, Tuple, Set
 import psutil
 from threading import Lock
 
+# Configuração segura do psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logging.warning("psutil não instalado - monitoramento desativado")
+
 # ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
 logging.basicConfig(
@@ -261,7 +269,9 @@ class ResourceMonitor:
     """Monitoramento avançado de recursos do sistema."""
     @staticmethod
     def get_system_stats() -> Dict[str, float]:
-        """Coleta métricas do sistema com thread safety."""
+        if not PSUTIL_AVAILABE:
+            return {}
+            
         with _RESOURCE_LOCK:
             try:
                 mem = psutil.virtual_memory()
@@ -2002,6 +2012,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
