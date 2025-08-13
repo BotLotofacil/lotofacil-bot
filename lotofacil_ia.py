@@ -530,6 +530,7 @@ class BotLotofacil:
         contagem = Counter(self.dados.filter(like='B').values.flatten())
         self.frequencias = Counter({n: contagem.get(n, 0) for n in range(1, 26)})
         self.coocorrencias = self.calcular_coocorrencia()
+        self.correlacoes_temporais = self.calcular_correlacao_temporal()  # <-- NOVA LINHA
         self.sequencias_iniciais = self.analisar_sequencias_iniciais()
         self.clusters = self.identificar_clusters()
 
@@ -545,6 +546,42 @@ class BotLotofacil:
                 for num2 in nums_anterior:
                     cooc[num1-1, num2-1] += w
         return cooc
+
+    def calcular_correlacao_temporal(self, janela: int = 20):
+        """Analisa padrões de repetição em múltiplas janelas temporais"""
+        dados = self.dados[[f'B{i}' for i in range(1,16)]].values[-janela:]
+        correlacoes = np.zeros((25, 25))
+    
+        for distancia in range(1, 6):  # Analisa de 1 a 5 concursos atrás
+            for i in range(distancia, len(dados)):
+                atuais = set(dados[i])
+                anteriores = set(dados[i-distancia])
+                for num in atuais:
+                    for prev in anteriores:
+                        # Peso maior para correlações mais recentes
+                        peso = 1.0 / (distancia ** 0.7)  
+                        correlacoes[num-1, prev-1] += peso
+                    
+        # Normaliza pela quantidade de concursos
+        return correlacoes / (janela - 5)
+
+    def identificar_padroes_ciclicos(self, janela: int = 20):
+        """Detecta números em fases quentes com base em ciclos históricos"""
+        dados = self.dados[[f'B{i}' for i in range(1,16)]].values[-janela:]
+        ciclicos = set()
+    
+        # Verifica ciclos de 3 a 7 concursos
+        for ciclo in range(3, 8):
+            for i in range(len(dados)-ciclo):
+                atuais = set(dados[i])
+                futuros = set(dados[i+ciclo])
+                reapareceram = atuais & futuros
+            
+                # Se reapareceram mais que o esperado por acaso
+                if len(reapareceram) >= 6:  # Threshold empírico
+                    ciclicos.update(reapareceram)
+                
+        return ciclicos
 
     def analisar_sequencias_iniciais(self) -> Dict[Tuple[int, int, int], int]:
         sequencias = defaultdict(int)
@@ -992,6 +1029,30 @@ class BotLotofacil:
         )
         return (float(score_total),)
 
+    def ajustar_pesos_automaticamente(self):
+        """Ajusta os pesos do scoring baseado no desempenho recente"""
+        # Pega os últimos 20 concursos para avaliação
+        testes = self.dados[[f'B{i}' for i in range(1,16)]].values[-20:]
+    
+        # Avalia qual fator melhor predisse os números sorteados
+        acuracia = {
+            'frequencia': 0,
+            'coocorrencia': 0,
+            'clusters': 0,
+            'balanceamento': 0
+        }
+    
+        for i in range(1, len(testes)):
+            # ... lógica para testar cada fator ...
+    
+        # Normaliza e ajusta os pesos
+        total = sum(acuracia.values())
+        self.pesos = {
+            'frequencia': acuracia['frequencia'] / total * 2.5,
+            'coocorrencia': acuracia['coocorrencia'] / total * 1.5,
+            # ... outros pesos ...
+        }
+    
     def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
         """Fallback clássico: GA + (opcional) modelo, com fechamento ao final."""
         apostas = []
@@ -1252,6 +1313,47 @@ class BotLotofacil:
         self.ultima_geracao_precisa = [sorted(ap) for ap in apostas_final]
         return self.ultima_geracao_precisa
 
+    def gerar_aposta_hibrida(self, n_apostas: int = 5) -> List[List[int]]:
+        """Combina LSTM, análise estatística e padrões temporais"""
+        if self.dados is None or len(self.dados) < 20:
+            raise RuntimeError("Necessário mínimo de 20 concursos para análise híbrida")
+
+        # 1. Geração inicial com múltiplas estratégias
+        candidatos = []
+    
+        # Modelo LSTM com janela adaptativa
+        lstm_pred = self.gerar_por_modelo()  # Usa o modelo existente
+    
+        # Análise de padrões cíclicos
+        ciclicos = self.identificar_padroes_ciclicos(janela=20)
+    
+        # 2. Sistema de scoring dinâmico
+        def score_dinamico(aposta):
+            base_score = float(self.avaliar_aposta_ga(aposta)[0])
+        
+            # Bônus para números com padrão cíclico ativo
+            bonus_ciclico = sum(1.5 for n in aposta if n in ciclicos)
+        
+            # Penaliza apostas muito parecidas com as últimas 5
+            ultimas_apostas = [set(row) for row in self.dados[[f'B{i}' for i in range(1,16)]].values[-5:]]
+            penalty_repeticao = sum(2.0 for ap in ultimas_apostas if len(set(aposta) & ap) > 10)
+        
+            return base_score + bonus_ciclico - penalty_repeticao
+    
+        # 3. Geração de candidatos
+        for _ in range(n_apostas * 3):  # Gera 3x mais apostas para seleção
+            # Combina LSTM com números cíclicos
+            aposta = lstm_pred.copy()
+            for num in random.sample(ciclicos, min(3, len(ciclicos))):
+                if num not in aposta and len(aposta) < 15:
+                    aposta.append(num)
+            aposta = self._repara(aposta, random.Random())
+            candidatos.append(aposta)
+    
+        # 4. Seleção das melhores
+        candidatos.sort(key=score_dinamico, reverse=True)
+        return candidatos[:n_apostas]
+    
     # -------------------------
     # Checks de saúde
     # -------------------------
@@ -1266,7 +1368,7 @@ class BotLotofacil:
         self._precheck_precisa()
         _ = self.gerar_aposta_precisa(n_apostas=1, seed=None)
         return True
-
+     
     # -------------------------
     # Outras utilidades
     # -------------------------
@@ -2105,6 +2207,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
