@@ -16,7 +16,6 @@ from collections import Counter, defaultdict
 import logging
 import warnings
 from typing import Optional, Dict, List, Tuple, Set
-import psutil
 from threading import Lock
 
 # Configuração segura do psutil
@@ -304,7 +303,7 @@ class ResourceMonitor:
     """Monitoramento avançado de recursos do sistema."""
     @staticmethod
     def get_system_stats() -> Dict[str, float]:
-        if not PSUTIL_AVAILABE:
+        if not PSUTIL_AVAILABLE:
             return {}
             
         with _RESOURCE_LOCK:
@@ -2106,6 +2105,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
