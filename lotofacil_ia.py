@@ -1031,26 +1031,53 @@ class BotLotofacil:
 
     def ajustar_pesos_automaticamente(self):
         """Ajusta os pesos do scoring baseado no desempenho recente"""
-        # Pega os últimos 20 concursos para avaliação
+        if len(self.dados) < 20:
+            return  # Não ajusta se houver poucos dados
+
+        # Pré-calcula dados fora do loop
         testes = self.dados[[f'B{i}' for i in range(1,16)]].values[-20:]
-    
-        # Avalia qual fator melhor predisse os números sorteados
+        freq = Counter(self.dados[[f'B{i}' for i in range(1,16)]].values.flatten())
+        clusters = self.clusters  # Assume que self.clusters já existe
+
         acuracia = {
             'frequencia': 0,
             'coocorrencia': 0,
             'clusters': 0,
             'balanceamento': 0
         }
-    
+
         for i in range(1, len(testes)):
-            # ... lógica para testar cada fator ...
-    
-        # Normaliza e ajusta os pesos
-        total = sum(acuracia.values())
+            nums_reais = set(testes[i])
+            nums_anterior = set(testes[i-1])
+
+            # 1. Avaliação por frequência
+            pred_freq = set([n for n, _ in freq.most_common(15)])
+            acuracia['frequencia'] += len(nums_reais & pred_freq)
+
+            # 2. Avaliação por coocorrência
+            cooc_scores = {n: sum(self.coocorrencias[n-1, num-1] for num in nums_anterior) for n in range(1, 26)}
+            pred_cooc = set([n for n, _ in sorted(cooc_scores.items(), key=lambda x: -x[1])[:15]])
+            acuracia['coocorrencia'] += len(nums_reais & pred_cooc)
+
+            # 3. Avaliação por clusters (exemplo simplificado)
+            cluster_counts = {cid: len(set(nums_anterior) & set(nums)) for cid, nums in clusters.items()}
+            cid_mais_comum = max(cluster_counts, key=cluster_counts.get)
+            pred_cluster = set(clusters[cid_mais_comum][:15])  # Pega até 15 números do cluster mais comum
+            acuracia['clusters'] += len(nums_reais & pred_cluster)
+
+            # 4. Avaliação por balanceamento (exemplo: preferência por faixas balanceadas)
+            low, mid, high = self._count_low_mid_high(nums_anterior)
+            ideal = {1, 2, 3, 8, 9, 10, 15, 16, 17, 22, 23, 24}  # Exemplo de números "balanceados"
+            pred_bal = set(sorted(ideal, key=lambda x: -freq[x])[:15])
+            acuracia['balanceamento'] += len(nums_reais & pred_bal)
+
+        # Normalização final
+        total = sum(acuracia.values()) or 1  # Evita divisão por zero
         self.pesos = {
-            'frequencia': acuracia['frequencia'] / total * 2.5,
-            'coocorrencia': acuracia['coocorrencia'] / total * 1.5,
-            # ... outros pesos ...
+            'frequencia': (acuracia['frequencia'] / total) * 2.5,
+            'coocorrencia': (acuracia['coocorrencia'] / total) * 1.5,
+            'clusters': (acuracia['clusters'] / total) * 1.2,
+            'balanceamento': (acuracia['balanceamento'] / total) * 1.8
         }
     
     def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
@@ -2207,6 +2234,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
