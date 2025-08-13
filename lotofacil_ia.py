@@ -632,24 +632,24 @@ class BotLotofacil:
         return model
 
     def verificar_integridade_dados(self):
-    """Verifica consistência básica dos dados carregados"""
-    if self.dados is None:
-        return False
+        """Verifica consistência básica dos dados carregados"""
+        if self.dados is None:
+            return False
         
-    # Verifica se todos os números estão no intervalo correto
-    for i in range(1, 16):
-        col = f'B{i}'
-        if col in self.dados.columns:
-            if not all(1 <= num <= 25 for num in self.dados[col].dropna()):
-                logger.error(f"Valores inválidos encontrados na coluna {col}")
-                return False
+        # Verifica se todos os números estão no intervalo correto
+        for i in range(1, 16):
+            col = f'B{i}'
+            if col in self.dados.columns:
+                if not all(1 <= num <= 25 for num in self.dados[col].dropna()):
+                    logger.error(f"Valores inválidos encontrados na coluna {col}")
+                    return False
                 
-    # Verifica se não há duplicatas de concurso
-    if 'numero' in self.dados.columns and self.dados['numero'].duplicated().any():
-        logger.error("Números de concurso duplicados encontrados")
-        return False
+        # Verifica se não há duplicatas de concurso
+        if 'numero' in self.dados.columns and self.dados['numero'].duplicated().any():
+            logger.error("Números de concurso duplicados encontrados")
+            return False
         
-    return True
+        return True
     
     def preparar_dados_treinamento(self) -> Tuple[np.ndarray, np.ndarray]:
         dados_numeros = self.dados[[f'B{i}' for i in range(1,16)]].values
@@ -2106,6 +2106,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
