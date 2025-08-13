@@ -151,16 +151,51 @@ MANUAL_USUARIO = (
     "O bot é uma ferramenta de análise e entretenimento. Não garante prêmios ou lucro em apostas.\n"
 )
 
-def backup_csv() -> None:
-    """Cria um backup timestampado do CSV principal, se existir."""
+def backup_csv() -> Optional[str]:
+    """
+    Cria um backup timestampado do CSV principal com tratamento robusto de erros.
+    Retorna o caminho do backup criado ou None em caso de falha crítica.
+    """
     origem = "lotofacil_historico.csv"
-    if os.path.exists(origem):
-        destino = f"lotofacil_historico_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    if not os.path.exists(origem):
+        logger.warning("Arquivo origem para backup não encontrado: %s", origem)
+        return None
+
+    # Garante que o diretório de backups existe
+    os.makedirs("backups", exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    destino = f"backups/lotofacil_historico_backup_{timestamp}.csv"
+    
+    try:
+        # Tentativa principal de backup
+        shutil.copy2(origem, destino)
+        logger.info("Backup principal criado com sucesso: %s", destino)
+        return destino
+        
+    except Exception as e:
+        logger.error("Falha no backup principal (tentando fallback): %s", str(e))
+        
+        # Fallback 1 - Tentativa no mesmo diretório
+        destino_fallback = f"lotofacil_historico_backup_emergencia_{timestamp}.csv"
         try:
-            shutil.copy2(origem, destino)
-            logger.info(f"Backup automático criado: {destino}")
-        except Exception as e:
-            logger.warning(f"Falha ao criar backup do CSV: {e}")
+            shutil.copy2(origem, destino_fallback)
+            logger.warning("Backup de emergência criado: %s", destino_fallback)
+            return destino_fallback
+            
+        except Exception as e2:
+            logger.critical("Falha no backup de emergência: %s", str(e2))
+            
+            # Fallback 2 - Tentativa apenas copiar conteúdo
+            try:
+                with open(origem, 'r') as f_orig, open(destino_fallback, 'w') as f_dest:
+                    f_dest.write(f_orig.read())
+                logger.warning("Backup básico criado (sem metadados): %s", destino_fallback)
+                return destino_fallback
+                
+            except Exception as e3:
+                logger.critical("Falha crítica em todos os métodos de backup: %s", str(e3))
+                return None
 
 # Configuração inicial de warnings e logging
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
@@ -169,7 +204,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
+    
 # Token do Telegram via variável de ambiente (Railway/Render/etc.)
 TOKEN = os.getenv("TOKEN", "").strip()
 if not TOKEN:
@@ -412,31 +447,33 @@ class BotLotofacil:
     # -------------------------
     # Dados / preparação
     # -------------------------
-    def carregar_dados(self, atualizar: bool = False) -> Optional[pd.DataFrame]:
-        cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
-        if not atualizar and os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except Exception as e:
-                logger.warning(f"Cache corrompido. Recriando... Erro: {str(e)}")
-
+    def carregar_dados(self, atualizar: bool = False, force_csv: bool = False) -> Optional[pd.DataFrame]:
+    cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
+    
+    # Se forçado a ler do CSV ou se não há cache, ler do CSV
+    if force_csv or atualizar or not os.path.exists(cache_file):
         if not os.path.exists('lotofacil_historico.csv'):
             logger.error("Arquivo lotofacil_historico.csv não encontrado.")
             return None
-
+            
         df = pd.read_csv('lotofacil_historico.csv')
         processed = self.preprocessar_dados(df) if df is not None else None
-
+        
         if processed is not None:
             try:
                 with open(cache_file, 'wb') as f:
                     pickle.dump(processed, f)
-                processed.to_csv('lotofacil_historico.csv', index=False)
             except Exception as e:
-                logger.error(f"Falha ao salvar cache ou CSV: {str(e)}")
-
+                logger.error(f"Falha ao salvar cache: {str(e)}")
         return processed
+    
+    # Caso contrário, usar o cache
+    try:
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+    except Exception as e:
+        logger.warning(f"Cache corrompido. Recarregando do CSV... Erro: {str(e)}")
+        return self.carregar_dados(atualizar=True)
 
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
@@ -594,6 +631,26 @@ class BotLotofacil:
             pass
         return model
 
+    def verificar_integridade_dados(self):
+    """Verifica consistência básica dos dados carregados"""
+    if self.dados is None:
+        return False
+        
+    # Verifica se todos os números estão no intervalo correto
+    for i in range(1, 16):
+        col = f'B{i}'
+        if col in self.dados.columns:
+            if not all(1 <= num <= 25 for num in self.dados[col].dropna()):
+                logger.error(f"Valores inválidos encontrados na coluna {col}")
+                return False
+                
+    # Verifica se não há duplicatas de concurso
+    if 'numero' in self.dados.columns and self.dados['numero'].duplicated().any():
+        logger.error("Números de concurso duplicados encontrados")
+        return False
+        
+    return True
+    
     def preparar_dados_treinamento(self) -> Tuple[np.ndarray, np.ndarray]:
         dados_numeros = self.dados[[f'B{i}' for i in range(1,16)]].values
         X, y = [], []
@@ -1758,17 +1815,54 @@ def comando_inserir(update, context):
             df[f'repetidos_{rep}'] = repetidos
 
         df = df.sort_values('numero').reset_index(drop=True)
-        backup_csv()
+        
+        # Backup com verificação
+        backup_path = backup_csv()
+        if backup_path is None:
+            logger.error("Falha crítica nos backups!")
+            update.message.reply_text(
+                "⚠️ ATENÇÃO: Resultado inserido mas FALHA NOS BACKUPS!\n"
+                "Verifique imediatamente o servidor."
+            )
+
+        # Salva o arquivo principal
         df.to_csv(arq, index=False, encoding='utf-8')
 
-        update.message.reply_text(
-            f"✅ Resultado inserido com sucesso!\nConcurso: {proximo_numero}\nData: {data}\n"
-            f"Dezenas: {' '.join(str(d).zfill(2) for d in dezenas_int)}"
-        )
-    except Exception as e:
-        logger.error(f"Erro ao inserir resultado: {str(e)}")
-        update.message.reply_text("❌ Falha ao inserir o resultado. Tente novamente.")
+        # Forçar recarregamento dos dados
+        bot.dados = bot.carregar_dados(atualizar=True, force_csv=True)
+        
+        # Verificação de integridade
+        if not bot.verificar_integridade_dados():
+            logger.error("Problemas de integridade detectados nos dados!")
+            update.message.reply_text(
+                "⚠️ ATENÇÃO: Problemas de integridade detectados nos dados!\n"
+                "Verifique os logs e valide manualmente os dados."
+            )
+            return
 
+        # Atualiza análise e modelo se os dados estiverem íntegros
+        if bot.dados is not None:
+            bot.analisar_dados()
+            if hasattr(bot, 'modelo'):
+                bot.modelo = bot.construir_modelo()
+
+        update.message.reply_text(
+            f"✅ Resultado inserido com sucesso!\n"
+            f"Concurso: {proximo_numero}\n"
+            f"Data: {data}\n"
+            f"Dezenas: {' '.join(str(d).zfill(2) for d in dezenas_int)}\n\n"
+            "✔️ Dados verificados e íntegros\n"
+            "✔️ Modelo atualizado com sucesso"
+        )
+
+    except Exception as e:
+        logger.error(f"Erro ao inserir resultado: {str(e)}", exc_info=True)
+        update.message.reply_text(
+            "❌ Falha crítica ao inserir o resultado.\n"
+            "Detalhes foram registrados nos logs.\n"
+            "Por favor, tente novamente ou verifique os dados."
+        )
+        
 def comando_meuid(update: Update, context: CallbackContext) -> None:
     user_id = update.effective_user.id
     update.message.reply_text(
@@ -2012,6 +2106,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
