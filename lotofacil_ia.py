@@ -448,33 +448,33 @@ class BotLotofacil:
     # Dados / preparação
     # -------------------------
     def carregar_dados(self, atualizar: bool = False, force_csv: bool = False) -> Optional[pd.DataFrame]:
-    cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
+        cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
     
-    # Se forçado a ler do CSV ou se não há cache, ler do CSV
-    if force_csv or atualizar or not os.path.exists(cache_file):
-        if not os.path.exists('lotofacil_historico.csv'):
-            logger.error("Arquivo lotofacil_historico.csv não encontrado.")
-            return None
+        # Se forçado a ler do CSV ou se não há cache, ler do CSV
+        if force_csv or atualizar or not os.path.exists(cache_file):
+            if not os.path.exists('lotofacil_historico.csv'):
+                logger.error("Arquivo lotofacil_historico.csv não encontrado.")
+                return None
             
-        df = pd.read_csv('lotofacil_historico.csv')
-        processed = self.preprocessar_dados(df) if df is not None else None
+            df = pd.read_csv('lotofacil_historico.csv')
+            processed = self.preprocessar_dados(df) if df is not None else None
         
-        if processed is not None:
-            try:
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(processed, f)
-            except Exception as e:
-                logger.error(f"Falha ao salvar cache: {str(e)}")
-        return processed
+            if processed is not None:
+                try:
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(processed, f)
+                except Exception as e:
+                    logger.error(f"Falha ao salvar cache: {str(e)}")
+            return processed
     
-    # Caso contrário, usar o cache
-    try:
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
-    except Exception as e:
-        logger.warning(f"Cache corrompido. Recarregando do CSV... Erro: {str(e)}")
-        return self.carregar_dados(atualizar=True)
-
+        # Caso contrário, usar o cache
+        try:
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Cache corrompido. Recarregando do CSV... Erro: {str(e)}")
+            return self.carregar_dados(atualizar=True)
+        
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
             required_cols = ['data'] + [f'B{i}' for i in range(1,16)]
@@ -2106,6 +2106,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
