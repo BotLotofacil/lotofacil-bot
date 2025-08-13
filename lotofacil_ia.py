@@ -5,6 +5,7 @@
 # Stdlib
 import os
 import sys
+import signal 
 import traceback
 import shutil
 import pickle
@@ -15,6 +16,8 @@ from collections import Counter, defaultdict
 import logging
 import warnings
 from typing import Optional, Dict, List, Tuple, Set
+import psutil
+from threading import Lock
 
 # ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
@@ -46,7 +49,6 @@ import telegram
 print("PTB version:", telegram.__version__)
 from telegram import Update, InputFile
 from telegram.ext import Updater, CommandHandler, CallbackContext
-from telegram.utils.request import Request  # v13.x
 
 # Núcleo preciso (score + GRASP + diversidade)
 from apostas_engine import gerar_apostas as gerar_apostas_precisas
@@ -104,6 +106,10 @@ def _stop_progress(job, msg, final_text):
         msg.edit_text(final_text, parse_mode='HTML')
     except Exception:
         pass
+
+def handler(signum, frame):
+    raise TimeoutError("Operação excedeu o tempo limite")
+signal.signal(signal.SIGALRM, handler)  # Configura o handler
 
 # ==== fim helpers ====
 
@@ -213,6 +219,11 @@ def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
     user_map[comando] = agora
     return True
 
+# Adicione após as constantes existentes:
+_RESOURCE_LOCK = Lock()
+_MAX_MEMORY_ALERT = 85  # % de uso de memória para alerta
+_MIN_MEMORY_ALERT = 1024  # MB livres mínimos para alerta
+
 # ======================================
 # Bloco 3 — SecurityManager & DataFetcher
 # ======================================
@@ -245,6 +256,69 @@ class SecurityManager:
     def is_authorized(self, user_id: int) -> bool:
         """Autorizado se estiver na whitelist ou for admin."""
         return user_id in self.whitelist or self.is_admin(user_id)
+
+class ResourceMonitor:
+    """Monitoramento avançado de recursos do sistema."""
+    @staticmethod
+    def get_system_stats() -> Dict[str, float]:
+        """Coleta métricas do sistema com thread safety."""
+        with _RESOURCE_LOCK:
+            try:
+                mem = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+                cpu = psutil.cpu_percent(interval=1)
+                disk = psutil.disk_usage('/')
+                net_io = psutil.net_io_counters()
+                
+                return {
+                    'cpu_percent': cpu,
+                    'mem_total': mem.total / (1024 ** 3),  # GB
+                    'mem_used': mem.used / (1024 ** 3),
+                    'mem_percent': mem.percent,
+                    'swap_used': swap.used / (1024 ** 3),
+                    'disk_used': disk.used / (1024 ** 3),
+                    'disk_percent': disk.percent,
+                    'bytes_sent': net_io.bytes_sent / (1024 ** 2),  # MB
+                    'bytes_recv': net_io.bytes_recv / (1024 ** 2),
+                    'process_mem': psutil.Process().memory_info().rss / (1024 ** 2)  # MB
+                }
+            except Exception as e:
+                logger.error(f"Erro ao coletar métricas: {str(e)}")
+                return {}
+
+    @staticmethod
+    def log_resource_usage(context: CallbackContext) -> None:
+        """Log detalhado com alertas condicionais."""
+        stats = ResourceMonitor.get_system_stats()
+        if not stats:
+            return
+
+        alert = ""
+        if stats['mem_percent'] > _MAX_MEMORY_ALERT:
+            alert = f" ⚠️ ALERTA: Memória acima de {_MAX_MEMORY_ALERT}%"
+        elif (stats['mem_total'] - stats['mem_used']) < (_MIN_MEMORY_ALERT / 1024):
+            alert = f" ⚠️ ALERTA: Menos de {_MIN_MEMORY_ALERT}MB livres"
+
+        message = (
+            f"📊 Resource Monitor | "
+            f"CPU: {stats['cpu_percent']:.1f}% | "
+            f"Mem: {stats['mem_percent']:.1f}% ({stats['mem_used']:.2f}GB/{stats['mem_total']:.2f}GB) | "
+            f"Process: {stats['process_mem']:.2f}MB | "
+            f"Disk: {stats['disk_percent']:.1f}%{alert}"
+        )
+        
+        logger.info(message)
+        
+        if alert and hasattr(context, 'bot') and ADMIN_USER_IDS:
+            for admin_id in ADMIN_USER_IDS:
+                try:
+                    context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"🚨 ALERTA DE RECURSOS\n{message}",
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Falha ao enviar alerta para admin {admin_id}: {str(e)}")
 
 class DataFetcher:
     """Obtém último resultado da Lotofácil com fallback entre fontes."""
@@ -1806,18 +1880,50 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
             raise
 
 def main() -> None:
-    """Função principal para iniciar o bot com tratamento robusto de erros."""
+    """Função principal do bot com monitoramento de recursos completo."""
     try:
-        # Versão corrigida da inicialização do Updater
+        # Ativa timeout global (2 minutos para inicialização)
+        signal.alarm(120)
+
+        # 1. Inicialização do Updater
         updater = Updater(
             token=TOKEN,
             use_context=True,
-            request_kwargs=REQUEST_KWARGS,  # Passamos o dicionário de configurações diretamente
+            request_kwargs=REQUEST_KWARGS,
             workers=4
         )
-
         dp = updater.dispatcher
 
+        # 2. Configuração do sistema de monitoramento
+        jq = updater.job_queue
+        if jq:
+            # Agendamento principal do monitoramento (30 em 30 minutos)
+            jq.run_repeating(
+                callback=ResourceMonitor.log_resource_usage,
+                interval=1800,
+                first=10
+            )
+            
+            # Teste rápido do sistema após 5 segundos
+            jq.run_once(
+                lambda ctx: logger.info("✅ Teste inicial do monitoramento concluído com sucesso"),
+                when=5
+            )
+            logger.info("Monitoramento de recursos ativado (intervalo: 30 minutos)")
+        else:
+            logger.warning("JobQueue indisponível - monitoramento de recursos desativado")
+
+        # 3. Verificação de saúde inicial do monitoramento
+        try:
+            stats = ResourceMonitor.get_system_stats()
+            if not stats:
+                logger.warning("Coleta inicial de recursos retornou vazia")
+            else:
+                logger.info(f"Teste de saúde OK - Memória: {stats['mem_percent']:.1f}%")
+        except Exception as e:
+            logger.error(f"Falha no teste inicial do monitoramento: {str(e)}")
+
+        # 4. Registro dos handlers de comandos
         handlers = [
             CommandHandler("start", start),
             CommandHandler("meuid", comando_meuid),
@@ -1834,9 +1940,11 @@ def main() -> None:
         for handler in handlers:
             dp.add_handler(handler)
 
+        # 5. Configuração do handler de erros
         dp.add_error_handler(error_handler)
 
-        logger.info("Iniciando bot com configurações otimizadas...")
+        # 6. Inicialização do bot
+        logger.info("Iniciando bot com verificações de recursos...")
         updater.start_polling(
             poll_interval=0.5,
             timeout=15,
@@ -1844,34 +1952,46 @@ def main() -> None:
         )
 
         logger.info(
-            "✅ Bot iniciado com sucesso e aguardando comandos | "
-            f"connect_timeout={REQUEST_KWARGS['connect_timeout']}s, "
-            f"read_timeout={REQUEST_KWARGS['read_timeout']}s, "
-            f"con_pool_size={REQUEST_KWARGS['con_pool_size']}"
+            f"✅ Bot em operação normal\n"
+            f"• Monitoramento: {'ATIVO' if jq else 'INATIVO'}\n"
+            f"• Checks de memória: >{_MAX_MEMORY_ALERT}% (alerta)\n"
+            f"• Workers: {updater.dispatcher.workers}\n"
+            f"• Timeouts: {REQUEST_KWARGS['connect_timeout']}s connect, {REQUEST_KWARGS['read_timeout']}s read"
         )
 
+        # Desativa timeout após inicialização bem-sucedida
+        signal.alarm(0)
         updater.idle()
 
     except telegram.error.NetworkError as e:
-        logger.critical(f"ERRO DE REDE: Não foi possível conectar ao Telegram: {str(e)}")
-        raise SystemExit(1) from e
-
-    except telegram.error.TimedOut as e:
-        logger.critical(f"TIMEOUT: Conexão com a API do Telegram expirada: {str(e)}")
-        raise SystemExit(1) from e
-
-    except telegram.error.InvalidToken as e:
-        logger.critical("TOKEN INVÁLIDO: Verifique o token de acesso do bot")
-        raise SystemExit(1) from e
-
+        logger.critical(f"ERRO DE REDE: {str(e)}")
+        sys.exit(1)
+    except telegram.error.InvalidToken:
+        logger.critical("TOKEN INVÁLIDO - Verifique a variável de ambiente TOKEN")
+        sys.exit(1)
+    except telegram.error.TelegramError as e:
+        logger.critical(f"ERRO DO TELEGRAM: {str(e)}")
+        sys.exit(1)
+    except TimeoutError:
+        logger.critical("Timeout na inicialização do bot (excedeu 2 minutos)")
+        sys.exit(1)
     except Exception as e:
         logger.critical(
             f"ERRO INESPERADO: {str(e)}\n"
             f"Tipo: {type(e).__name__}\n"
-            f"Stack Trace: {traceback.format_exc()}",
+            f"Traceback: {traceback.format_exc()}",
             exc_info=True
         )
-        raise SystemExit(1) from e
+        sys.exit(1)
+    finally:
+        logger.info("Encerrando processo do bot...")
+        signal.alarm(0)  # Garante que o timeout seja cancelado
+        if 'updater' in locals():  # Verifica se a variável existe
+            try:
+                updater.stop()
+                updater.is_idle = False
+            except Exception as e:   
+                logger.error(f"Erro ao parar updater: {str(e)}")
 
 if __name__ == "__main__":
     try:
@@ -1881,8 +2001,7 @@ if __name__ == "__main__":
         sys.exit(0)
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
-        raise  # <<< APENAS 'raise', sem duplicar
-
+        raise
 
 
 
