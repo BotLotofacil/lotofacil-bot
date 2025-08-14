@@ -1487,30 +1487,30 @@ class BotLotofacil:
             if col not in self.dados.columns:
                 raise RuntimeError(f"Coluna obrigatória ausente no histórico: {col}")
 
-   def _teste_engine_precisa_startup(self) -> bool:
-       try:
-           self._precheck_precisa()
+    def _teste_engine_precisa_startup(self) -> bool:
+        try:
+            self._precheck_precisa()
         
-           # Adiciona verificação de segurança para divisão
-           if len(self.dados) < 30:
-               raise RuntimeError("Histórico insuficiente (mínimo 30 concursos)")
+            # Adiciona verificação de segurança para divisão
+            if len(self.dados) < 30:
+                raise RuntimeError("Histórico insuficiente (mínimo 30 concursos)")
             
-           # Verifica se há dados suficientes para cálculo de estatísticas
-           required_cols = [f'B{i}' for i in range(1,16)]
-           if not all(col in self.dados.columns for col in required_cols):
-               raise RuntimeError("Colunas de dezenas ausentes")
+            # Verifica se há dados suficientes para cálculo de estatísticas
+            required_cols = [f'B{i}' for i in range(1,16)]
+            if not all(col in self.dados.columns for col in required_cols):
+                raise RuntimeError("Colunas de dezenas ausentes")
             
-           # Teste seguro de geração
-           apostas = self.gerar_aposta_precisa(n_apostas=1, seed=42)  # Seed fixa para teste
+            # Teste seguro de geração
+            apostas = self.gerar_aposta_precisa(n_apostas=1, seed=42)  # Seed fixa para teste
         
-           if not apostas or len(apostas[0]) != 15:
-               raise RuntimeError("Geração retornou aposta inválida")
+            if not apostas or len(apostas[0]) != 15:
+                raise RuntimeError("Geração retornou aposta inválida")
             
-           return True
+            return True
         
-       except Exception as e:
-           logger.error(f"Falha no teste do engine preciso: {str(e)}", exc_info=True)
-           raise
+        except Exception as e:
+            logger.error(f"Falha no teste do engine preciso: {str(e)}", exc_info=True)
+            raise
      
     # -------------------------
     # Outras utilidades
@@ -2450,6 +2450,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
