@@ -1453,8 +1453,9 @@ class BotLotofacil:
     # Outras utilidades
     # -------------------------
     def gerar_aposta_precisa_com_retry(self, n_apostas: int, seed: Optional[int] = None, retries: int = 2) -> List[List[int]]:
-        last_exc: Optional[Exception] = None
-        self._precheck_precisa()
+        """Versão com retry automático para falhas no engine preciso"""
+        last_exc = None
+    
         for tent in range(retries + 1):
             try:
                 resultado = self.gerar_aposta_precisa(n_apostas=n_apostas, seed=seed)
@@ -1462,24 +1463,24 @@ class BotLotofacil:
                 self.precise_enabled = True
                 self.precise_last_error = None
                 return resultado
-            except Exception as e:
+            
+            except Exception as e:  # Corrigido: bloco except completo
                 last_exc = e
                 self.precise_fail_count += 1
                 self.precise_last_error = str(e)
-                try:
-                    import time as _t
-                    _t.sleep(0.2 * (tent + 1))
-                except Exception:
-                    pass
+                if tent < retries:  # Apenas espera se não for a última tentativa
+                    time.sleep(0.5 * (tent + 1))
 
+        # Se chegou aqui é porque todas as tentativas falharam
         self.precise_enabled = False
-        if self.precise_fail_count >= 3:
+        if self.precise_fail_count >= 3 and ADMIN_USER_IDS:
             try:
-                for _admin in ADMIN_USER_IDS:
-                    self._notificar_admin_falha_precisa(_admin)
-            except Exception:
-                pass
-        raise last_exc or RuntimeError("Falha desconhecida no engine precisa.")
+                for admin_id in ADMIN_USER_IDS:
+                    self._notificar_admin_falha_precisa(admin_id)
+            except Exception as admin_error:
+                logger.error(f"Falha ao notificar admin: {admin_error}")
+
+        raise last_exc if last_exc else RuntimeError("Falha desconhecida no engine preciso")
 
     def _notificar_admin_falha_precisa(self, admin_id: int) -> None:
         try:
@@ -2290,6 +2291,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
