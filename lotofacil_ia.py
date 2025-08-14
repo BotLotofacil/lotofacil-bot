@@ -1092,15 +1092,25 @@ class BotLotofacil:
         
     def diversificar_apostas(self, apostas: List[List[int]]) -> List[List[int]]:
         """Força inclusão de números sub-representados (17, 21)"""
-        rng = random.Random(sum(sum(ap) for ap in apostas)  # Seed determinística
+        if not apostas:
+            return apostas
+        
+        rng = random.Random(sum(sum(ap) for ap in apostas))  # Seed determinística
     
-        for i, ap in enumerate(apostas):
+        for ap in apostas:
             # Verifica se faltam números sub-representados
-            if sum(1 for n in ap if n in {17, 21}) == 0:
-                # Escolhe posição segura para substituir (evitando números críticos)
-                posicoes_seguras = [j for j, n in enumerate(ap) if n not in {13, 14, 20}]
-                if posicoes_seguras:
-                    ap[posicoes_seguras[rng.randint(0, len(posicoes_seguras)-1]] = rng.choice([17, 21])
+            if not any(n in {17, 21} for n in ap):
+                # Escolhe posições seguras para substituição
+                posicoes_validas = [
+                    idx for idx, num in enumerate(ap) 
+                    if num not in {13, 14, 20}
+                ]
+            
+                if posicoes_validas:
+                    # Seleciona posição aleatória
+                    pos = rng.choice(posicoes_validas)
+                    # Substitui por 17 ou 21
+                    ap[pos] = rng.choice([17, 21])
     
         return apostas
         
@@ -2280,6 +2290,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
