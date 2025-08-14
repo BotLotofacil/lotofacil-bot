@@ -1266,8 +1266,8 @@ class BotLotofacil:
         if seed is None:
             try:
                 seed = int(df['numero'].max()) + 1
-        except Exception:
-            seed = len(df) + 1
+            except Exception:
+                seed = len(df) + 1
 
         n_alvo = max(1, min(int(n_apostas), 10))
         rng_global = random.Random(seed)
@@ -2301,6 +2301,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
