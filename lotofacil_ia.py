@@ -1455,7 +1455,7 @@ class BotLotofacil:
     def gerar_aposta_precisa_com_retry(self, n_apostas: int, seed: Optional[int] = None, retries: int = 2) -> List[List[int]]:
         """Versão com retry automático para falhas no engine preciso"""
         last_exc = None
-    
+
         for tent in range(retries + 1):
             try:
                 resultado = self.gerar_aposta_precisa(n_apostas=n_apostas, seed=seed)
@@ -2301,6 +2301,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
