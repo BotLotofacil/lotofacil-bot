@@ -258,16 +258,29 @@ def verificar_e_corrigir_permissoes_arquivo(caminho: str) -> bool:
         return False
     
     try:
+        # Obtém modo atual
         modo_atual = os.stat(caminho).st_mode & 0o777
         logger.info(f"Permissões atuais de {caminho}: {oct(modo_atual)}")
         
-        if modo_atual & 0o200 == 0:  # Sem permissão de escrita
-            logger.warning(f"Corrigindo permissões de {caminho} para 664")
-            os.chmod(caminho, 0o664)
-            return True
+        # Permissões ideais: dono/grupo podem ler+escrever, outros só leitura
+        modo_ideal = 0o664
+        
+        if modo_atual != modo_ideal:
+            logger.warning(f"Corrigindo permissões de {caminho} de {oct(modo_atual)} para {oct(modo_ideal)}")
+            try:
+                os.chmod(caminho, modo_ideal)
+                # Verifica se a mudança foi aplicada
+                novo_modo = os.stat(caminho).st_mode & 0o777
+                if novo_modo != modo_ideal:
+                    logger.error(f"Falha ao alterar permissões de {caminho}. Novo modo: {oct(novo_modo)}")
+                    return False
+                return True
+            except Exception as e:
+                logger.error(f"Erro ao alterar permissões de {caminho}: {str(e)}")
+                return False
         return True
     except Exception as e:
-        logger.error(f"Falha ao verificar/corrigir permissões de {caminho}: {str(e)}")
+        logger.error(f"Falha ao verificar permissões de {caminho}: {str(e)}")
         return False
 
 # ======================================
@@ -452,49 +465,55 @@ class BotLotofacil:
     # -------------------------
     def carregar_dados(self, atualizar: bool = False, force_csv: bool = False) -> Optional[pd.DataFrame]:
         cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
+        csv_path = 'lotofacil_historico.csv'
 
-        # Verificação de permissões (ADICIONE AQUI)
-        if os.path.exists('lotofacil_historico.csv'):
-            print("Permissões do arquivo:", oct(os.stat('lotofacil_historico.csv').st_mode & 0o777))
-        else:
-            logger.error("Arquivo CSV não encontrado para verificação de permissões.")
-    
-        # 1. Tenta usar cache se não for atualização forçada
+        # 1. Verificação robusta de permissões
+        if not verificar_e_corrigir_permissoes_arquivo(csv_path):
+            logger.error(f"Não foi possível verificar/corrigir permissões de {csv_path}")
+            return None
+
+        # 2. Tenta usar cache se não for atualização forçada
         if not (atualizar or force_csv) and os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
-                logger.info(f"Dados carregados do cache. Concursos: {len(cached_data)}")
-                return cached_data
+                if isinstance(cached_data, pd.DataFrame) and not cached_data.empty:
+                    logger.info(f"Dados carregados do cache. Concursos: {len(cached_data)}")
+                    return cached_data
+                else:
+                    logger.warning("Cache inválido - recarregando do CSV")
             except Exception as e:
                 logger.warning(f"Cache corrompido. Recarregando CSV... Erro: {str(e)}")
 
-        # 2. Carregamento do CSV
-        if not os.path.exists('lotofacil_historico.csv'):
-            logger.error("Arquivo CSV não encontrado.")
+        # 3. Carregamento do CSV com verificações
+        if not os.path.exists(csv_path):
+            logger.error(f"Arquivo CSV não encontrado em {os.path.abspath(csv_path)}")
             return None
 
         try:
-            # Carrega e valida as colunas
+            # Carrega com verificação de colunas
             required_cols = ['numero', 'data'] + [f'B{i}' for i in range(1,16)]
-            df = pd.read_csv('lotofacil_historico.csv', usecols=required_cols)
+            df = pd.read_csv(csv_path)
         
-            # Verificação única de colunas
-            if not all(col in df.columns for col in required_cols):
-                missing = set(required_cols) - set(df.columns)
-                logger.error(f"Colunas faltantes: {missing}")
+            # Verifica colunas obrigatórias
+            missing_cols = set(required_cols) - set(df.columns)
+            if missing_cols:
+                logger.error(f"Colunas faltantes no CSV: {missing_cols}")
                 return None
 
-            # Processamento
-            processed = self.preprocessar_dados(df) if df is not None else None
-            del df  # Libera memória
-            gc.collect()
-
+            # Processamento seguro
+            processed = self.preprocessar_dados(df[required_cols])
             if processed is None or len(processed) == 0:
-                logger.error("Falha no pré-processamento ou dados vazios")
+                logger.error("Falha no pré-processamento - dados vazios ou inválidos")
                 return None
 
-            # Salva cache
+            # Verificação de consistência
+            if 'numero' in processed.columns:
+                if processed['numero'].duplicated().any():
+                    logger.error("Números de concurso duplicados encontrados")
+                    return None
+
+            # Salva cache com verificação
             try:
                 with open(cache_file, 'wb') as f:
                     pickle.dump(processed, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -505,7 +524,7 @@ class BotLotofacil:
             return processed
 
         except Exception as e:
-            logger.error(f"Erro ao carregar dados: {str(e)}", exc_info=True)
+            logger.error(f"Erro crítico ao carregar dados: {str(e)}", exc_info=True)
             return None
         
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -1468,10 +1487,30 @@ class BotLotofacil:
             if col not in self.dados.columns:
                 raise RuntimeError(f"Coluna obrigatória ausente no histórico: {col}")
 
-    def _teste_engine_precisa_startup(self) -> bool:
-        self._precheck_precisa()
-        _ = self.gerar_aposta_precisa(n_apostas=1, seed=None)
-        return True
+   def _teste_engine_precisa_startup(self) -> bool:
+       try:
+           self._precheck_precisa()
+        
+           # Adiciona verificação de segurança para divisão
+           if len(self.dados) < 30:
+               raise RuntimeError("Histórico insuficiente (mínimo 30 concursos)")
+            
+           # Verifica se há dados suficientes para cálculo de estatísticas
+           required_cols = [f'B{i}' for i in range(1,16)]
+           if not all(col in self.dados.columns for col in required_cols):
+               raise RuntimeError("Colunas de dezenas ausentes")
+            
+           # Teste seguro de geração
+           apostas = self.gerar_aposta_precisa(n_apostas=1, seed=42)  # Seed fixa para teste
+        
+           if not apostas or len(apostas[0]) != 15:
+               raise RuntimeError("Geração retornou aposta inválida")
+            
+           return True
+        
+       except Exception as e:
+           logger.error(f"Falha no teste do engine preciso: {str(e)}", exc_info=True)
+           raise
      
     # -------------------------
     # Outras utilidades
@@ -1965,20 +2004,8 @@ def comando_inserir(update, context):
             return
 
         # 3. VERIFICAÇÃO DE PERMISSÕES
-        try:
-            with open(csv_path, 'a') as f:
-                f.write('')  # Teste de escrita
-                logger.info("Permissões do arquivo OK (teste de escrita bem-sucedido)")
-        except PermissionError as e:
-            logger.critical(f"ERRO DE PERMISSÃO: {str(e)}")
-            update.message.reply_text(
-                "❌ ERRO CRÍTICO: Sem permissão para escrever no arquivo CSV.\n"
-                "Verifique as permissões do arquivo e diretório."
-            )
-            return
-        except Exception as e:
-            logger.error(f"Falha ao verificar permissões: {str(e)}")
-            update.message.reply_text("❌ Falha ao verificar permissões do arquivo.")
+        if not verificar_e_corrigir_permissoes_arquivo(csv_path):
+            update.message.reply_text("❌ Problema com permissões do arquivo CSV.")
             return
 
         # 4. BACKUP ANTES DE MODIFICAR
@@ -2025,14 +2052,32 @@ def comando_inserir(update, context):
         for i in range(1, 6):
             nova_linha[f'repetidos_{i}'] = 0
 
-        # 7. SALVAMENTO ROBUSTO EM 3 ETAPAS
+        # 7.1 VERIFICAÇÃO PRÉ-SALVAMENTO
+        try:
+            novo_df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
+            
+            # Verificação de sequência numérica
+            if 'numero' in novo_df.columns:
+                nums = novo_df['numero'].values
+                if any(nums[i] >= nums[i+1] for i in range(len(nums)-1)):
+                    raise ValueError("Números de concurso não sequenciais após inserção")
+                    
+            # Verificação das dezenas
+            for i in range(1, 16):
+                col = f'B{i}'
+                if any(not 1 <= num <= 25 for num in novo_df[col].dropna()):
+                    raise ValueError(f"Valor inválido encontrado na coluna {col}")
+
+        except Exception as e:
+            logger.error(f"Falha na verificação pré-salvamento: {str(e)}")
+            update.message.reply_text("❌ Falha na verificação dos dados antes de salvar.")
+            return
+
+        # 7.2 SALVAMENTO ROBUSTO EM 3 ETAPAS
         try:
             # Etapa 1: Salvar para arquivo temporário
             temp_path = f"{csv_path}.tmp"
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                df.to_csv(f, index=False)
-                f.flush()
-                os.fsync(f.fileno())  # Força escrita no disco
+            novo_df.to_csv(temp_path, index=False)
             
             # Etapa 2: Verificar arquivo temporário
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
@@ -2069,10 +2114,15 @@ def comando_inserir(update, context):
             if bot.dados is None:
                 raise RuntimeError("Falha ao recarregar dados")
                 
-            # Verifica se o novo registro está presente
+            # Verificação robusta do recarregamento
             ultimo_numero = bot.dados['numero'].iloc[-1]
+            ultimas_dezenas = set(bot.dados.iloc[-1][[f'B{i}' for i in range(1,16)]])
+            
             if ultimo_numero != proximo_numero:
-                raise RuntimeError(f"Discrepância no número do concurso")
+                raise RuntimeError(f"Discrepância no número do concurso (esperado: {proximo_numero}, obtido: {ultimo_numero})")
+                
+            if ultimas_dezenas != set(dezenas_int):
+                raise RuntimeError("Discrepância nas dezenas do último concurso")
                 
         except Exception as e:
             logger.critical(f"FALHA NO RECARREGAMENTO: {str(e)}")
@@ -2221,49 +2271,86 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
 
 def main() -> None:
     """Função principal do bot com monitoramento de recursos completo."""
+    # Configuração inicial segura
+    try:
+        # Verifica/Cria diretórios necessários
+        os.makedirs("backups", exist_ok=True)
+        os.makedirs("cache", exist_ok=True)
+        
+        # Verifica permissões de arquivos críticos
+        arquivos_necessarios = ['lotofacil_historico.csv', 'whitelist.txt']
+        for arquivo in arquivos_necessarios:
+            if os.path.exists(arquivo):
+                if not verificar_e_corrigir_permissoes_arquivo(arquivo):
+                    logger.error(f"Não foi possível corrigir permissões de {arquivo}")
+            else:
+                logger.warning(f"Arquivo {arquivo} não encontrado - criando vazio")
+                open(arquivo, 'a').close()
+                verificar_e_corrigir_permissoes_arquivo(arquivo)
+                
+    except Exception as e:
+        logger.critical(f"Falha na configuração inicial: {str(e)}")
+        sys.exit(1)
+
     try:
         # Ativa timeout global (2 minutos para inicialização)
         signal.alarm(120)
 
-        # 1. Inicialização do Updater
-        updater = Updater(
-            token=TOKEN,
-            use_context=True,
-            request_kwargs=REQUEST_KWARGS,
-            workers=4
-        )
-        dp = updater.dispatcher
+        # 1. Inicialização robusta do Updater
+        updater = None
+        try:
+            updater = Updater(
+                token=TOKEN,
+                use_context=True,
+                request_kwargs=REQUEST_KWARGS,
+                workers=4
+            )
+            dp = updater.dispatcher
+        except Exception as e:
+            logger.critical(f"Falha na inicialização do Updater: {str(e)}")
+            raise
 
-        # 2. Configuração do sistema de monitoramento
-        jq = updater.job_queue
+        # 2. Configuração avançada do sistema de monitoramento
+        jq = updater.job_queue if updater else None
         if jq:
-            # Agendamento principal do monitoramento (30 em 30 minutos)
-            jq.run_repeating(
-                callback=ResourceMonitor.log_resource_usage,
-                interval=1800,
-                first=10
-            )
-            
-            # Teste rápido do sistema após 5 segundos
-            jq.run_once(
-                lambda ctx: logger.info("✅ Teste inicial do monitoramento concluído com sucesso"),
-                when=5
-            )
-            logger.info("Monitoramento de recursos ativado (intervalo: 30 minutos)")
+            # Monitoramento principal com tratamento de erros
+            try:
+                jq.run_repeating(
+                    callback=ResourceMonitor.log_resource_usage,
+                    interval=1800,
+                    first=10
+                )
+                
+                # Teste rápido do sistema
+                jq.run_once(
+                    lambda ctx: logger.info("✅ Teste inicial do monitoramento concluído com sucesso"),
+                    when=5
+                )
+                logger.info("Monitoramento de recursos ativado (intervalo: 30 minutos)")
+            except Exception as e:
+                logger.error(f"Falha ao configurar monitoramento: {str(e)}")
         else:
             logger.warning("JobQueue indisponível - monitoramento de recursos desativado")
 
-        # 3. Verificação de saúde inicial do monitoramento
+        # 3. Verificação completa de saúde inicial
         try:
             stats = ResourceMonitor.get_system_stats()
             if not stats:
                 logger.warning("Coleta inicial de recursos retornou vazia")
             else:
-                logger.info(f"Teste de saúde OK - Memória: {stats['mem_percent']:.1f}%")
+                # Verificação crítica de recursos
+                alerta = ""
+                if stats['mem_percent'] > _MAX_MEMORY_ALERT:
+                    alerta = f" ⚠️ Memória alta: {stats['mem_percent']:.1f}%"
+                if stats['disk_percent'] > 90:
+                    alerta += f" ⚠️ Disco quase cheio: {stats['disk_percent']:.1f}%"
+                
+                status = f"Teste de saúde OK - Memória: {stats['mem_percent']:.1f}%{alerta}"
+                logger.info(status)
         except Exception as e:
             logger.error(f"Falha no teste inicial do monitoramento: {str(e)}")
 
-        # 4. Registro dos handlers de comandos
+        # 4. Registro seguro dos handlers de comandos
         handlers = [
             CommandHandler("start", start),
             CommandHandler("meuid", comando_meuid),
@@ -2278,18 +2365,26 @@ def main() -> None:
         ]
 
         for handler in handlers:
-            dp.add_handler(handler)
+            try:
+                dp.add_handler(handler)
+            except Exception as e:
+                logger.error(f"Falha ao registrar handler {handler.callback.__name__}: {str(e)}")
 
-        # 5. Configuração do handler de erros
+        # 5. Configuração reforçada do handler de erros
         dp.add_error_handler(error_handler)
 
-        # 6. Inicialização do bot
+        # 6. Inicialização segura do bot
         logger.info("Iniciando bot com verificações de recursos...")
-        updater.start_polling(
-            poll_interval=0.5,
-            timeout=15,
-            drop_pending_updates=True
-        )
+        try:
+            updater.start_polling(
+                poll_interval=0.5,
+                timeout=15,
+                drop_pending_updates=True,
+                bootstrap_retries=3  # Tentativas adicionais de conexão
+            )
+        except Exception as e:
+            logger.critical(f"Falha no start_polling: {str(e)}")
+            raise
 
         logger.info(
             f"✅ Bot em operação normal\n"
@@ -2326,12 +2421,25 @@ def main() -> None:
     finally:
         logger.info("Encerrando processo do bot...")
         signal.alarm(0)  # Garante que o timeout seja cancelado
-        if 'updater' in locals():  # Verifica se a variável existe
-            try:
+        
+        # Limpeza segura dos recursos
+        try:
+            if 'updater' in locals() and updater:
                 updater.stop()
                 updater.is_idle = False
-            except Exception as e:   
-                logger.error(f"Erro ao parar updater: {str(e)}")
+                logger.info("Updater parado com sucesso")
+        except Exception as e:
+            logger.error(f"Erro ao parar updater: {str(e)}")
+        
+        # Limpeza de cache e recursos do TensorFlow
+        try:
+            if 'bot' in globals():
+                if hasattr(bot, 'modelo'):
+                    del bot.modelo
+                    logger.info("Modelo TensorFlow liberado da memória")
+            gc.collect()
+        except Exception as e:
+            logger.error(f"Erro na limpeza de recursos: {str(e)}")
 
 if __name__ == "__main__":
     try:
@@ -2342,6 +2450,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
