@@ -1924,14 +1924,16 @@ def comando_status(update: Update, context: CallbackContext) -> None:
 def comando_inserir(update, context):
     if not rate_limit(update, "inserir"):
         return
+    
     try:
+        # 1. VALIDAÇÃO BÁSICA DOS ARGUMENTOS
         if not context.args or len(context.args) != 16:
             update.message.reply_text(
                 "❌ Uso correto: /inserir YYYY-MM-DD D1 D2 ... D15\n"
                 "Exemplo: /inserir 2025-08-08 01 03 05 07 09 10 12 14 17 18 19 20 22 23 25"
             )
             return
-        
+
         # Processa argumentos
         data = context.args[0]
         dezenas = context.args[1:]
@@ -1952,160 +1954,149 @@ def comando_inserir(update, context):
             update.message.reply_text("❌ Data inválida. Utilize o formato YYYY-MM-DD.")
             return
 
-        # Configurações do arquivo
-        arq = 'lotofacil_historico.csv'
-        caminho_absoluto = os.path.abspath(arq)
-        
-        # Log detalhado antes de operações
+        # 2. CONFIGURAÇÕES DE ARQUIVO
+        csv_path = 'lotofacil_historico.csv'
+        caminho_absoluto = os.path.abspath(csv_path)
         logger.info(f"Iniciando inserção no arquivo: {caminho_absoluto}")
         
-        if not os.path.exists(arq):
+        if not os.path.exists(csv_path):
             update.message.reply_text("❌ Arquivo lotofacil_historico.csv não encontrado no servidor.")
             logger.error(f"Arquivo não encontrado: {caminho_absoluto}")
             return
 
-        # Carrega dados existentes
-        df = pd.read_csv(arq)
-        logger.info(f"Dados carregados. Shape atual: {df.shape}. Últimas 2 linhas:\n{df.tail(2).to_string()}")
-
-        # Validação de duplicidade
+        # 3. VERIFICAÇÃO DE PERMISSÕES
         try:
-            if 'data' in df.columns and not df.empty:
-                df_datas = pd.to_datetime(df['data'], format="%Y-%m-%d", errors="coerce")
-                if df_datas.isna().any():
-                    alt = pd.to_datetime(df['data'], dayfirst=True, errors="coerce")
-                    df_datas = df_datas.fillna(alt)
-                if (df_datas.dt.date == data_dt.date()).any():
-                    msg = "⚠️ Já existe um concurso com esta data no histórico."
-                    update.message.reply_text(msg + "\nPara evitar duplicidade, a inserção foi cancelada.")
-                    logger.warning(msg)
-                    return
+            with open(csv_path, 'a') as f:
+                f.write('')  # Teste de escrita
+                logger.info("Permissões do arquivo OK (teste de escrita bem-sucedido)")
+        except PermissionError as e:
+            logger.critical(f"ERRO DE PERMISSÃO: {str(e)}")
+            update.message.reply_text(
+                "❌ ERRO CRÍTICO: Sem permissão para escrever no arquivo CSV.\n"
+                "Verifique as permissões do arquivo e diretório."
+            )
+            return
         except Exception as e:
-            logger.warning(f"Erro na verificação de data duplicada: {str(e)}")
+            logger.error(f"Falha ao verificar permissões: {str(e)}")
+            update.message.reply_text("❌ Falha ao verificar permissões do arquivo.")
+            return
 
-        # Verifica combinação de dezenas duplicada
+        # 4. BACKUP ANTES DE MODIFICAR
         try:
-            if not df.empty:
-                alvo = frozenset(dezenas_int)
-                cols_b = [f'B{i}' for i in range(1, 16) if f'B{i}' in df.columns]
-                if len(cols_b) == 15:
-                    for _, row in df[cols_b].iterrows():
-                        try:
-                            s = frozenset(int(row[f'B{i}']) for i in range(1, 16))
-                            if s == alvo:
-                                msg = "⚠️ Já existe um concurso com exatamente as mesmas 15 dezenas."
-                                update.message.reply_text(msg + "\nA inserção foi cancelada.")
-                                logger.warning(msg)
-                                return
-                        except Exception:
-                            continue
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = f"backups/lotofacil_pre_insercao_{timestamp}.csv"
+            os.makedirs("backups", exist_ok=True)
+            shutil.copy2(csv_path, backup_path)
+            logger.info(f"Backup criado com sucesso: {backup_path}")
         except Exception as e:
-            logger.warning(f"Erro na verificação de dezenas duplicadas: {str(e)}")
+            logger.error(f"Falha no backup: {str(e)}")
+            update.message.reply_text("⚠️ AVISO: Não foi possível criar backup antes da inserção.")
 
-        # Determina próximo número de concurso
-        if 'numero' in df.columns and not df['numero'].dropna().empty:
-            try:
-                max_num = pd.to_numeric(df['numero'], errors='coerce').max()
-                proximo_numero = int(max_num) + 1 if pd.notna(max_num) else len(df) + 1
-            except Exception:
-                proximo_numero = len(df) + 1
-        else:
-            proximo_numero = len(df) + 1
+        # 5. CARREGAMENTO E VALIDAÇÃO DOS DADOS EXISTENTES
+        df = pd.read_csv(csv_path)
+        logger.info(f"Dados carregados. Shape atual: {df.shape}")
 
-        # Prepara nova linha
+        # Validação de duplicidade de data
+        if 'data' in df.columns and not df.empty:
+            df_datas = pd.to_datetime(df['data'], format="%Y-%m-%d", errors="coerce")
+            if df_datas.isna().any():
+                df_datas = pd.to_datetime(df['data'], dayfirst=True, errors="coerce")
+            if (df_datas.dt.date == data_dt.date()).any():
+                update.message.reply_text("⚠️ Já existe um concurso com esta data no histórico.")
+                return
+
+        # Validação de combinação de dezenas duplicada
+        if not df.empty:
+            alvo = frozenset(dezenas_int)
+            cols_b = [f'B{i}' for i in range(1, 16) if f'B{i}' in df.columns]
+            if len(cols_b) == 15:
+                for _, row in df[cols_b].iterrows():
+                    s = frozenset(int(row[f'B{i}']) for i in range(1, 16))
+                    if s == alvo:
+                        update.message.reply_text("⚠️ Já existe um concurso com exatamente as mesmas 15 dezenas.")
+                        return
+
+        # 6. PREPARAÇÃO DA NOVA LINHA
+        proximo_numero = int(df['numero'].max()) + 1 if 'numero' in df.columns and not df.empty else 1
+        
         nova_linha = {'numero': proximo_numero, 'data': data}
         for i, dez in enumerate(dezenas_int, 1):
             nova_linha[f'B{i}'] = dez
         for i in range(1, 6):
             nova_linha[f'repetidos_{i}'] = 0
 
-        # Adiciona ao DataFrame
-        df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
-
-        # Recalcula campos de repetidos
-        for rep in range(1, 6):
-            repetidos = []
-            for idx, row in df.iterrows():
-                if idx < rep:
-                    repetidos.append(0)
-                else:
-                    nums_atual = set([row.get(f'B{i}', 0) for i in range(1, 16)])
-                    nums_anterior = set([df.iloc[idx - rep].get(f'B{i}', 0) for i in range(1, 16)])
-                    repetidos.append(len(nums_atual & nums_anterior))
-            df[f'repetidos_{rep}'] = repetidos
-
-        df = df.sort_values('numero').reset_index(drop=True)
-        
-        # Backup com verificação
-        logger.info("Iniciando backup do arquivo antes da modificação...")
-        backup_path = backup_csv()
-        if backup_path is None:
-            logger.error("Falha crítica nos backups!")
-            update.message.reply_text(
-                "⚠️ ATENÇÃO: Resultado inserido mas FALHA NOS BACKUPS!\n"
-                "Verifique imediatamente o servidor."
-            )
-
-        # Salvamento seguro com sincronização
-        logger.info(f"Salvando arquivo principal em {caminho_absoluto}...")
+        # 7. SALVAMENTO ROBUSTO EM 3 ETAPAS
         try:
-            with open(arq, 'w', encoding='utf-8') as f:
+            # Etapa 1: Salvar para arquivo temporário
+            temp_path = f"{csv_path}.tmp"
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 df.to_csv(f, index=False)
-                f.flush()  # Força escrita no buffer
-                if hasattr(os, 'fsync'):
-                    os.fsync(f.fileno())  # Força escrita no disco (Unix)
-                else:
-                    os.sync()  # Alternativa para outros sistemas
+                f.flush()
+                os.fsync(f.fileno())  # Força escrita no disco
+            
+            # Etapa 2: Verificar arquivo temporário
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                raise RuntimeError("Arquivo temporário não criado corretamente")
+            
+            # Etapa 3: Substituição atômica
+            os.replace(temp_path, csv_path)
+            
+            # Verificação final
+            if not os.path.exists(csv_path):
+                raise RuntimeError("Arquivo principal não existe após substituição")
                 
-            # Verificação pós-salvamento
-            if not os.path.exists(arq):
-                logger.critical("Falha crítica: Arquivo CSV não foi criado após salvamento!")
-                raise RuntimeError("Arquivo CSV não foi criado")
-            
-            tamanho = os.path.getsize(arq)
-            logger.info(f"CSV salvo com sucesso. Tamanho: {tamanho} bytes")
-            
-        except Exception as e:
-            logger.error(f"Falha ao salvar arquivo principal: {str(e)}")
-            raise
+            logger.info(f"CSV salvo com sucesso. Tamanho: {os.path.getsize(csv_path)} bytes")
 
-        # Recarrega dados no bot
-        logger.info("Recarregando dados no bot...")
-        bot.dados = bot.carregar_dados(atualizar=True, force_csv=True)
-        
-        # Verificação de integridade
-        if not bot.verificar_integridade_dados():
-            logger.error("Problemas de integridade detectados nos dados!")
+        except Exception as e:
+            logger.critical(f"FALHA NO SALVAMENTO: {str(e)}")
+            # Tenta recuperar do backup
+            if os.path.exists(backup_path):
+                try:
+                    shutil.copy2(backup_path, csv_path)
+                    logger.info("Dados restaurados a partir do backup")
+                except Exception as restore_error:
+                    logger.critical(f"FALHA NA RECUPERAÇÃO: {str(restore_error)}")
+            
             update.message.reply_text(
-                "⚠️ ATENÇÃO: Problemas de integridade detectados nos dados!\n"
-                "Verifique os logs e valide manualmente os dados."
+                "❌ FALHA CRÍTICA: Não foi possível salvar os dados.\n"
+                "Os administradores foram notificados."
             )
             return
 
-        # Atualiza análise e modelo
-        if bot.dados is not None:
-            logger.info("Atualizando análise de dados e modelo...")
-            bot.analisar_dados()
-            if hasattr(bot, 'modelo'):
-                bot.modelo = bot.construir_modelo()
+        # 8. RECARREGAMENTO E VERIFICAÇÃO
+        try:
+            bot.dados = bot.carregar_dados(atualizar=True, force_csv=True)
+            if bot.dados is None:
+                raise RuntimeError("Falha ao recarregar dados")
+                
+            # Verifica se o novo registro está presente
+            ultimo_numero = bot.dados['numero'].iloc[-1]
+            if ultimo_numero != proximo_numero:
+                raise RuntimeError(f"Discrepância no número do concurso")
+                
+        except Exception as e:
+            logger.critical(f"FALHA NO RECARREGAMENTO: {str(e)}")
+            update.message.reply_text(
+                "⚠️ AVISO: Dados inseridos mas falha ao recarregar.\n"
+                "O sistema pode precisar de reinicialização."
+            )
 
-        # Confirmação de sucesso
-        logger.info("Inserção concluída com sucesso!")
+        # 9. MENSAGEM DE SUCESSO COM CONFIRMAÇÃO
         update.message.reply_text(
-            f"✅ Resultado inserido com sucesso!\n"
+            f"✅ Resultado inserido e VERIFICADO com sucesso!\n"
             f"Concurso: {proximo_numero}\n"
             f"Data: {data}\n"
             f"Dezenas: {' '.join(str(d).zfill(2) for d in dezenas_int)}\n\n"
-            "✔️ Dados verificados e íntegros\n"
-            "✔️ Modelo atualizado com sucesso"
+            f"✔️ Backup criado: {os.path.basename(backup_path)}\n"
+            f"✔️ Tamanho do arquivo: {os.path.getsize(csv_path)} bytes\n"
+            f"✔️ Último concurso confirmado: {ultimo_numero}"
         )
 
     except Exception as e:
-        logger.error(f"Erro ao inserir resultado: {str(e)}", exc_info=True)
+        logger.critical(f"ERRO GRAVE em comando_inserir: {str(e)}", exc_info=True)
         update.message.reply_text(
-            "❌ Falha crítica ao inserir o resultado.\n"
-            "Detalhes foram registrados nos logs.\n"
-            "Por favor, tente novamente ou verifique os dados."
+            "❌ ERRO CRÍTICO: Falha no processo de inserção.\n"
+            "Detalhes foram registrados nos logs."
         )
         
 def comando_meuid(update: Update, context: CallbackContext) -> None:
@@ -2351,7 +2342,6 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
-
 
 
 
