@@ -10,6 +10,8 @@ import traceback
 import shutil
 import pickle
 import random
+import gc
+import itertools
 from io import BytesIO
 from datetime import datetime
 from collections import Counter, defaultdict
@@ -449,40 +451,54 @@ class BotLotofacil:
     def carregar_dados(self, atualizar: bool = False, force_csv: bool = False) -> Optional[pd.DataFrame]:
         cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
     
-        # Sempre força a leitura do CSV quando há atualização ou quando solicitado
-        if atualizar or force_csv or not os.path.exists(cache_file):
-            if not os.path.exists('lotofacil_historico.csv'):
-                logger.error("Arquivo lotofacil_historico.csv não encontrado.")
-                return None
-        
-            try:
-                df = pd.read_csv('lotofacil_historico.csv')
-                processed = self.preprocessar_dados(df) if df is not None else None
-        
-                if processed is not None:
-                    try:
-                        with open(cache_file, 'wb') as f:
-                            pickle.dump(processed, f)
-                        logger.info(f"Dados carregados do CSV e cache atualizado. Total de concursos: {len(processed)}")
-                    except Exception as e:
-                        logger.error(f"Falha ao salvar cache: {str(e)}")
-                return processed
-            except Exception as e:
-                logger.error(f"Erro ao ler arquivo CSV: {str(e)}")
-                return None
-    
-        # Caso contrário, usar o cache apenas se não for uma atualização
-        if not atualizar:
+        # 1. Tenta usar cache se não for atualização forçada
+        if not (atualizar or force_csv) and os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
-                    logger.info(f"Dados carregados do cache. Total de concursos: {len(cached_data)}")
-                    return cached_data
+                logger.info(f"Dados carregados do cache. Concursos: {len(cached_data)}")
+                return cached_data
             except Exception as e:
-                logger.warning(f"Cache corrompido. Recarregando do CSV... Erro: {str(e)}")
-                return self.carregar_dados(atualizar=True, force_csv=True)
-    
-        return None
+                logger.warning(f"Cache corrompido. Recarregando CSV... Erro: {str(e)}")
+
+        # 2. Carregamento do CSV
+        if not os.path.exists('lotofacil_historico.csv'):
+            logger.error("Arquivo CSV não encontrado.")
+            return None
+
+        try:
+            # Carrega e valida as colunas
+            required_cols = ['numero', 'data'] + [f'B{i}' for i in range(1,16)]
+            df = pd.read_csv('lotofacil_historico.csv', usecols=required_cols)
+        
+            # Verificação única de colunas
+            if not all(col in df.columns for col in required_cols):
+                missing = set(required_cols) - set(df.columns)
+                logger.error(f"Colunas faltantes: {missing}")
+                return None
+
+            # Processamento
+            processed = self.preprocessar_dados(df) if df is not None else None
+            del df  # Libera memória
+            gc.collect()
+
+            if processed is None or len(processed) == 0:
+                logger.error("Falha no pré-processamento ou dados vazios")
+                return None
+
+            # Salva cache
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(processed, f, protocol=pickle.HIGHEST_PROTOCOL)
+                logger.info(f"Dados carregados. Concursos: {len(processed)} | Cache atualizado")
+            except Exception as e:
+                logger.error(f"Falha ao salvar cache: {str(e)}")
+
+            return processed
+
+        except Exception as e:
+            logger.error(f"Erro ao carregar dados: {str(e)}", exc_info=True)
+            return None
         
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
@@ -2301,6 +2317,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
