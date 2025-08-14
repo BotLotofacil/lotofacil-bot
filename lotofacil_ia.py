@@ -1464,21 +1464,31 @@ class BotLotofacil:
                 self.precise_last_error = None
                 return resultado
             
-            except Exception as e:  # Corrigido: bloco except completo
+            except Exception as e:  # Bloco except completo
                 last_exc = e
                 self.precise_fail_count += 1
                 self.precise_last_error = str(e)
-                if tent < retries:  # Apenas espera se não for a última tentativa
-                    time.sleep(0.5 * (tent + 1))
+            
+                # Apenas espera se não for a última tentativa
+                if tent < retries:
+                    try:
+                        time.sleep(0.5 * (tent + 1))
+                    except Exception as sleep_error:
+                        logger.warning(f"Erro durante sleep: {sleep_error}")
 
-        # Se chegou aqui é porque todas as tentativas falharam
+        # Se todas as tentativas falharam
         self.precise_enabled = False
+    
+        # Notificação aos admins (com tratamento de erro)
         if self.precise_fail_count >= 3 and ADMIN_USER_IDS:
             try:
                 for admin_id in ADMIN_USER_IDS:
-                    self._notificar_admin_falha_precisa(admin_id)
-            except Exception as admin_error:
-                logger.error(f"Falha ao notificar admin: {admin_error}")
+                    try:
+                        self._notificar_admin_falha_precisa(admin_id)
+                    except Exception as notify_error:
+                        logger.error(f"Erro ao notificar admin {admin_id}: {notify_error}")
+            except Exception as general_error:
+                logger.error(f"Erro geral no sistema de notificação: {general_error}")
 
         raise last_exc if last_exc else RuntimeError("Falha desconhecida no engine preciso")
 
@@ -2291,6 +2301,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
