@@ -449,30 +449,40 @@ class BotLotofacil:
     def carregar_dados(self, atualizar: bool = False, force_csv: bool = False) -> Optional[pd.DataFrame]:
         cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
     
-        # Se forçado a ler do CSV ou se não há cache, ler do CSV
-        if force_csv or atualizar or not os.path.exists(cache_file):
+        # Sempre força a leitura do CSV quando há atualização ou quando solicitado
+        if atualizar or force_csv or not os.path.exists(cache_file):
             if not os.path.exists('lotofacil_historico.csv'):
                 logger.error("Arquivo lotofacil_historico.csv não encontrado.")
                 return None
-            
-            df = pd.read_csv('lotofacil_historico.csv')
-            processed = self.preprocessar_dados(df) if df is not None else None
         
-            if processed is not None:
-                try:
-                    with open(cache_file, 'wb') as f:
-                        pickle.dump(processed, f)
-                except Exception as e:
-                    logger.error(f"Falha ao salvar cache: {str(e)}")
-            return processed
+            try:
+                df = pd.read_csv('lotofacil_historico.csv')
+                processed = self.preprocessar_dados(df) if df is not None else None
+        
+                if processed is not None:
+                    try:
+                        with open(cache_file, 'wb') as f:
+                            pickle.dump(processed, f)
+                        logger.info(f"Dados carregados do CSV e cache atualizado. Total de concursos: {len(processed)}")
+                    except Exception as e:
+                        logger.error(f"Falha ao salvar cache: {str(e)}")
+                return processed
+            except Exception as e:
+                logger.error(f"Erro ao ler arquivo CSV: {str(e)}")
+                return None
     
-        # Caso contrário, usar o cache
-        try:
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            logger.warning(f"Cache corrompido. Recarregando do CSV... Erro: {str(e)}")
-            return self.carregar_dados(atualizar=True)
+        # Caso contrário, usar o cache apenas se não for uma atualização
+        if not atualizar:
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    logger.info(f"Dados carregados do cache. Total de concursos: {len(cached_data)}")
+                    return cached_data
+            except Exception as e:
+                logger.warning(f"Cache corrompido. Recarregando do CSV... Erro: {str(e)}")
+                return self.carregar_dados(atualizar=True, force_csv=True)
+    
+        return None
         
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
@@ -1040,10 +1050,10 @@ class BotLotofacil:
         clusters = self.clusters  # Assume que self.clusters já existe
 
         acuracia = {
-            'frequencia': 0,
-            'coocorrencia': 0,
-            'clusters': 0,
-            'balanceamento': 0
+            'frequencia': 2.3,
+            'coocorrencia': 1.7,
+            'clusters': 1.0,
+            'balanceamento': 2.0
         }
 
         for i in range(1, len(testes)):
@@ -1077,9 +1087,23 @@ class BotLotofacil:
             'frequencia': (acuracia['frequencia'] / total) * 2.5,
             'coocorrencia': (acuracia['coocorrencia'] / total) * 1.5,
             'clusters': (acuracia['clusters'] / total) * 1.2,
-            'balanceamento': (acuracia['balanceamento'] / total) * 1.8
+            'balanceamento': (acuracia['balanceamento'] / total) * 2.0
         }
+        
+    def diversificar_apostas(self, apostas: List[List[int]]) -> List[List[int]]:
+        """Força inclusão de números sub-representados (17, 21)"""
+        rng = random.Random(sum(sum(ap) for ap in apostas)  # Seed determinística
     
+        for i, ap in enumerate(apostas):
+            # Verifica se faltam números sub-representados
+            if sum(1 for n in ap if n in {17, 21}) == 0:
+                # Escolhe posição segura para substituir (evitando números críticos)
+                posicoes_seguras = [j for j, n in enumerate(ap) if n not in {13, 14, 20}]
+                if posicoes_seguras:
+                    ap[posicoes_seguras[rng.randint(0, len(posicoes_seguras)-1]] = rng.choice([17, 21])
+    
+        return apostas
+        
     def gerar_aposta(self, n_apostas: int = 5) -> List[List[int]]:
         """Fallback clássico: GA + (opcional) modelo, com fechamento ao final."""
         apostas = []
@@ -1232,8 +1256,8 @@ class BotLotofacil:
         if seed is None:
             try:
                 seed = int(df['numero'].max()) + 1
-            except Exception:
-                seed = len(df) + 1
+        except Exception:
+            seed = len(df) + 1
 
         n_alvo = max(1, min(int(n_apostas), 10))
         rng_global = random.Random(seed)
@@ -1254,7 +1278,7 @@ class BotLotofacil:
             for t in range(4):
                 try:
                     geradas = gerar_apostas_precisas(
-                        historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
+                         historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
                     )
                     if geradas:
                         cand_list.append(sorted(set(map(int, geradas[0])))[:15])
@@ -1337,6 +1361,25 @@ class BotLotofacil:
 
         # 7) Cinturão final
         apostas_final = self._forca_diversidade_lote(apostas_tmp, MIN_DIFF, rng_global, cobertura_execucao)
+        apostas_final = self.diversificar_apostas(apostas_final)  # <-- MELHORIA ADICIONADA
+
+        # Log de métricas (MELHORIA ADICIONADA)
+        pares = sum(1 for ap in apostas_final for n in ap if n % 2 == 0)
+        impares = len(apostas_final)*15 - pares
+        soma = sum(sum(ap) for ap in apostas_final) / len(apostas_final)
+        diferenca_media = sum(
+            15 - len(set(ap1) & set(ap2))
+            for ap1, ap2 in itertools.combinations(apostas_final, 2)
+        ) / (len(apostas_final)*(len(apostas_final)-1)/2)
+
+        logger.info(
+            f"Estatísticas pós-geração: "
+            f"Pares/Ímpares={pares}/{impares} | "
+            f"Soma média={soma:.1f} | "
+            f"Distinção média={diferenca_media:.1f} | "
+            f"Clusters={[self.verificar_clusters(ap) for ap in apostas_final]}"
+        )
+
         self.ultima_geracao_precisa = [sorted(ap) for ap in apostas_final]
         return self.ultima_geracao_precisa
 
@@ -1958,6 +2001,9 @@ def comando_inserir(update, context):
 
         # Forçar recarregamento dos dados
         bot.dados = bot.carregar_dados(atualizar=True, force_csv=True)
+
+        # Atualiza os dados no bot, forçando leitura do CSV
+        bot.dados = bot.carregar_dados(atualizar=True, force_csv=True)
         
         # Verificação de integridade
         if not bot.verificar_integridade_dados():
@@ -2234,6 +2280,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
