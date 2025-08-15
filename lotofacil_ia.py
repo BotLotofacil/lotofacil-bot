@@ -44,6 +44,18 @@ os.environ['OMP_NUM_THREADS'] = '1'
 # ThreadPool global para operações paralelas
 _GLOBAL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="aposta_")
 
+# ---- Logging precisa estar definido antes de qualquer uso de logger ----
+warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
+logging.basicConfig(
+    format='{"time": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# Função utilitária segura de envio
+from telegram.error import TelegramError
+from telegram.ext import ContextTypes
+
 async def safe_send_message(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -65,14 +77,6 @@ async def safe_send_message(
     except TelegramError as e:
         logger.error(f"Erro ao enviar mensagem para {chat_id}: {e}")
 
-# ---- Logging precisa estar definido antes de qualquer uso de logger ----
-warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
-logging.basicConfig(
-    format='{"time": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
 # Terceiros
 import requests
 import pandas as pd
@@ -90,11 +94,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Telegram
+# Telegram (v20+)
 import telegram
 print("PTB version:", telegram.__version__)
 from telegram import Update, InputFile
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 # Núcleo preciso (score + GRASP + diversidade)
 from apostas_engine import gerar_apostas as gerar_apostas_precisas
@@ -104,35 +114,32 @@ from apostas_engine import Config as ApostaConfig
 from time import time as _now
 import time
 
-# Configuração do timeout/pool para o bot (compatível com PTB v13.x)
+# Configuração do timeout/pool para o bot (PTB v20+ usa HTTPX internamente)
 REQUEST_KWARGS = {
     "connect_timeout": int(os.getenv("TELEGRAM_CONNECT_TIMEOUT", 10)),
     "read_timeout": int(os.getenv("TELEGRAM_READ_TIMEOUT", 20)),
-    "con_pool_size": int(os.getenv("TELEGRAM_CON_POOL_SIZE", 8)),
-    # REMOVIDO: "pool_timeout" (não existe no v13)
+    # "con_pool_size" e "pool_timeout" não são utilizados no PTB v20+
 }
 
-_PROGRESS_FRAMES = ["▁","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃"]
+# ============================
+# BLOCO 2 — LÓGICA DO COMANDO /APOSTA
+# ============================
 
-def _progress_tick(context):
-    """Versão segura com verificação de estado"""
-    if not hasattr(context.job, 'bot'):
-        return
-        
-    bot = context.job.bot
-    if getattr(bot, '_initializing', False) or not getattr(bot, '_ready', False):
-        context.job.schedule_removal()
-        return
-        
-    data = context.job.context
+_PROGRESS_FRAMES = ["▁", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃"]
+
+async def _progress_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Versão assíncrona segura com verificação de estado"""
+    job = context.job
+    data = job.data
+
     msg = data.get("msg")
     i = data.get("i", 0)
     t0 = data.get("t0", _now())
     frame = _PROGRESS_FRAMES[i % len(_PROGRESS_FRAMES)]
-    
+
     try:
         bar = frame * 20
-        msg.edit_text(
+        await msg.edit_text(
             f"⏳ <b>Gerando apostas...</b>\n{bar}\n<i>{int(_now() - t0)}s</i>",
             parse_mode='HTML'
         )
@@ -141,33 +148,32 @@ def _progress_tick(context):
     finally:
         data["i"] = i + 1
 
-def _start_progress(context, chat_id):
+async def _start_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Cria a mensagem e agenda atualizações periódicas."""
-    msg = context.bot.send_message(chat_id, "⏳ Iniciando geração...", parse_mode='HTML')
+    msg = await context.bot.send_message(chat_id, "⏳ Iniciando geração...", parse_mode='HTML')
     job = context.job_queue.run_repeating(
         _progress_tick,
         interval=0.7,
         first=0.0,
-        context={"msg": msg, "i": 0, "t0": _now()}
+        data={"msg": msg, "i": 0, "t0": _now()}
     )
     return msg, job
 
-def _stop_progress(job, msg, final_text):
+async def _stop_progress(job, msg, final_text: str):
     """Para as atualizações e finaliza a mensagem de progresso."""
     try:
         job.schedule_removal()
     except Exception:
         pass
     try:
-        msg.edit_text(final_text, parse_mode='HTML')
+        await msg.edit_text(final_text, parse_mode='HTML')
     except Exception:
         pass
 
+# Tratador de timeout de sistema Unix (opcional)
 def handler(signum, frame):
     raise TimeoutError("Operação excedeu o tempo limite")
 signal.signal(signal.SIGALRM, handler)  # Configura o handler
-
-# ==== fim helpers ====
 
 # ================================
 # CONTROLE ASSÍNCRONO POR USUÁRIO (SEM BLOQUEIO GLOBAL)
@@ -190,7 +196,7 @@ async def handler_aposta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
 
     # Inicia barra de progresso (mensagem + job)
-    progress_msg, job = _start_progress(context, chat_id)
+    progress_msg, job = await _start_progress(context, chat_id)
 
     try:
         # Gera a aposta com bloqueio assíncrono por usuário
@@ -200,14 +206,13 @@ async def handler_aposta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         dezenas_str = " ".join(f"{dez:02d}" for dez in aposta)
         texto_final = f"✅ <b>Sua aposta está pronta:</b>\n{dezenas_str}"
 
-        # Atualiza a mensagem de progresso com o resultado
-        _stop_progress(job, progress_msg, texto_final)
+        # Finaliza mensagem de progresso
+        await _stop_progress(job, progress_msg, texto_final)
 
     except Exception as e:
         logger.exception("Erro durante a geração de aposta")
-        _stop_progress(job, progress_msg, "⚠️ Erro ao gerar sua aposta. Tente novamente.")
-
-        
+        await _stop_progress(job, progress_msg, "⚠️ Erro ao gerar sua aposta. Tente novamente.")
+    
 # ================================
 # Bloco 2 — Constantes & Bootstrap
 # ================================
@@ -238,8 +243,10 @@ MANUAL_USUARIO = (
     "O bot é uma ferramenta de análise e entretenimento. Não garante prêmios ou lucro em apostas.\n"
 )
 
+MSG_RATE_LIMIT = "⏳ Aguarde alguns segundos antes de usar novamente."
+
 def backup_csv() -> Optional[str]:
-    """Versão com sincronização forçada"""
+    """Cria backup sincronizado do histórico em CSV"""
     origem = "lotofacil_historico.csv"
     if not os.path.exists(origem):
         logger.error("Arquivo origem para backup não encontrado: %s", origem)
@@ -250,36 +257,37 @@ def backup_csv() -> Optional[str]:
     destino = f"backups/lotofacil_historico_backup_{timestamp}.csv"
     
     try:
-        # Usando with para garantir fechamento
         with open(origem, 'rb') as f_orig, open(destino, 'wb') as f_dest:
             shutil.copyfileobj(f_orig, f_dest)
-            f_dest.flush()  # Força escrita
-            os.fsync(f_dest.fileno())  # Sincroniza com disco
-        
+            f_dest.flush()
+            os.fsync(f_dest.fileno())
+
         if os.path.exists(destino):
             logger.info(f"Backup criado com sucesso: {destino} ({os.path.getsize(destino)} bytes)")
             return destino
         else:
             logger.error("Falha misteriosa - backup não criado após operação aparentemente bem-sucedida")
             return None
-            
+
     except Exception as e:
         logger.error(f"Falha no backup principal: {str(e)}", exc_info=True)
         return None
-    
-# Token do Telegram via variável de ambiente (Railway/Render/etc.)
+
+# Token do Telegram via variável de ambiente
 TOKEN = os.getenv("TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("TOKEN não definido no ambiente.")
+
+# Diretório base do script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Diretório persistente do container (ex.: /data). Se existir, usamos como CWD.
 DATA_DIR = os.getenv("DATA_DIR")
 if DATA_DIR:
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # Copia arquivos iniciais para o volume, se ausentes
     for _fn in ("lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.keras"):
-        src = os.path.join(os.getcwd(), _fn)
+        src = os.path.join(BASE_DIR, _fn)
         dst = os.path.join(DATA_DIR, _fn)
         if (not os.path.exists(dst)) and os.path.exists(src):
             try:
@@ -287,7 +295,7 @@ if DATA_DIR:
             except Exception as e:
                 logger.warning(f"Não foi possível copiar {src} -> {dst}: {e}")
 
-    # Remove modelo legado .h5 se existir no volume
+    # Remove modelo legado .h5
     try:
         old_h5 = os.path.join(DATA_DIR, "modelo_lotofacil_avancado.h5")
         if os.path.exists(old_h5):
@@ -295,39 +303,41 @@ if DATA_DIR:
     except Exception:
         pass
 
-    # Passa a trabalhar dentro do volume
+    # Atualiza o diretório de trabalho
     try:
         os.chdir(DATA_DIR)
     except Exception as e:
         logger.warning(f"Falha ao trocar para DATA_DIR ({DATA_DIR}): {e}")
 
-# Admins e rate-limit
-ADMIN_USER_IDS: List[int] = [5344714174]  # ajuste conforme necessário
+# Admins e controle de recursos
+ADMIN_USER_IDS: Set[int] = {5344714174}  # ajuste conforme necessário
 
+_RESOURCE_LOCK = Lock()
+_MAX_MEMORY_ALERT = 85      # % uso de RAM
+_MIN_MEMORY_ALERT = 1024    # MB livres mínimos
+
+# Rate limit (anti-spam por usuário/comando)
 _rate_limit_map: Dict[int, Dict[str, float]] = {}
 
-def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
+async def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
     """
-    Anti-spam por usuário/comando.
+    Anti-spam por usuário/comando (async).
     Retorna False se deve bloquear a execução (muito cedo); True caso possa prosseguir.
     """
     user_id = update.effective_user.id
     agora = _now()
     user_map = _rate_limit_map.setdefault(user_id, {})
     ultimo = user_map.get(comando, 0.0)
+
     if agora - ultimo < segundos:
         try:
-            update.message.reply_text("⏳ Aguarde alguns segundos antes de usar novamente.")
+            await update.message.reply_text(MSG_RATE_LIMIT)
         except Exception:
             pass
         return False
+
     user_map[comando] = agora
     return True
-
-# Adicione após as constantes existentes:
-_RESOURCE_LOCK = Lock()
-_MAX_MEMORY_ALERT = 85  # % de uso de memória para alerta
-_MIN_MEMORY_ALERT = 1024  # MB livres mínimos para alerta
 
 def verificar_e_corrigir_permissoes_arquivo(caminho: str) -> bool:
     """Verifica e corrige permissões do arquivo, retorna True se ok"""
@@ -2730,6 +2740,7 @@ if __name__ == '__main__':
 
     # Execução do bot
     application.run_polling()
+
 
 
 
