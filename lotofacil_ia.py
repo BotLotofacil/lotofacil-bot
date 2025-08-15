@@ -23,9 +23,12 @@ import logging
 import warnings
 from typing import Optional, Dict, List, Tuple, Set
 from threading import Lock
-from dotenv import load_dotenv
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# leitura direta da variável
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("Variável TELEGRAM_BOT_TOKEN não encontrada. Verifique as configurações no Railway.")
 
 # Configuração segura do psutil
 try:
@@ -2489,6 +2492,7 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
 
 
 
