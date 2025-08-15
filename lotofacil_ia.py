@@ -464,20 +464,29 @@ class BotLotofacil:
     # Dados / preparação
     # -------------------------
     def carregar_dados(self, atualizar: bool = False, force_csv: bool = False) -> Optional[pd.DataFrame]:
+        """Carrega, valida, pré-processa e armazena os dados históricos da Lotofácil."""
         cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
         csv_path = 'lotofacil_historico.csv'
 
-        # 1. Verificação robusta de permissões
+        # Verifica permissões do arquivo
         if not verificar_e_corrigir_permissoes_arquivo(csv_path):
             logger.error(f"Não foi possível verificar/corrigir permissões de {csv_path}")
             return None
 
-        # 2. Tenta usar cache se não for atualização forçada
+        # Tenta carregar do cache
         if not (atualizar or force_csv) and os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
                 if isinstance(cached_data, pd.DataFrame) and not cached_data.empty:
+                    self.dados = cached_data
+                    self.frequencias = Counter(
+                        int(b) for i in range(1, 16) for b in cached_data[f'B{i}']
+                    )
+                    self.engine_precisa_ativa = True
+                    self.engine_precisa_falhas = 0
+                    self.engine_precisa_erro = None
+
                     logger.info(f"Dados carregados do cache. Concursos: {len(cached_data)}")
                     return cached_data
                 else:
@@ -485,55 +494,75 @@ class BotLotofacil:
             except Exception as e:
                 logger.warning(f"Cache corrompido. Recarregando CSV... Erro: {str(e)}")
 
-        # 3. Carregamento do CSV com verificações
+        # Leitura do CSV
         if not os.path.exists(csv_path):
             logger.error(f"Arquivo CSV não encontrado em {os.path.abspath(csv_path)}")
             return None
 
         try:
-            # Carrega com verificação de colunas
-            required_cols = ['numero', 'data'] + [f'B{i}' for i in range(1,16)]
-            df = pd.read_csv(csv_path)
-        
-            # Verifica colunas obrigatórias
-            missing_cols = set(required_cols) - set(df.columns)
-            if missing_cols:
-                logger.error(f"Colunas faltantes no CSV: {missing_cols}")
+            df = pd.read_csv(csv_path, encoding='utf-8', sep=',')
+
+            required_cols = ['numero', 'data'] + [f'B{i}' for i in range(1, 16)]
+            missing = set(required_cols) - set(df.columns)
+            if missing:
+                logger.error(f"Colunas faltantes no CSV: {missing}")
                 return None
 
-            # Processamento seguro
-            processed = self.preprocessar_dados(df[required_cols])
-            if processed is None or len(processed) == 0:
+            df_proc = self.preprocessar_dados(df[required_cols])
+            if df_proc is None or len(df_proc) == 0:
                 logger.error("Falha no pré-processamento - dados vazios ou inválidos")
                 return None
 
-            # Verificação de consistência
-            if 'numero' in processed.columns:
-                if processed['numero'].duplicated().any():
-                    logger.error("Números de concurso duplicados encontrados")
-                    return None
+            if df_proc['numero'].duplicated().any():
+                logger.error("Números de concurso duplicados encontrados")
+                return None
 
-            # Salva cache com verificação
+            # Salva em disco (cache)
             try:
                 with open(cache_file, 'wb') as f:
-                    pickle.dump(processed, f, protocol=pickle.HIGHEST_PROTOCOL)
-                logger.info(f"Dados carregados. Concursos: {len(processed)} | Cache atualizado")
+                    pickle.dump(df_proc, f, protocol=pickle.HIGHEST_PROTOCOL)
+                logger.info(f"Cache atualizado com {len(df_proc)} concursos")
             except Exception as e:
-                logger.error(f"Falha ao salvar cache: {str(e)}")
+                logger.warning(f"Falha ao salvar cache: {str(e)}")
 
-            return processed
+            # Atribuição aos atributos da instância
+            self.dados = df_proc
+            self.frequencias = Counter(
+                int(b) for i in range(1, 16) for b in df_proc[f'B{i}']
+            )
+            if hasattr(self, "cache") and isinstance(self.cache, dict):
+                self.cache.clear()
+                self.cache.update({"dados_carregados": datetime.now().isoformat()})
+
+            self.engine_precisa_ativa = True
+            self.engine_precisa_falhas = 0
+            self.engine_precisa_erro = None
+
+            logger.info(f"Dados carregados com sucesso. Concursos válidos: {len(df_proc)}")
+            logger.info(f"Números mais frequentes: {self.frequencias.most_common(5)}")
+
+            return df_proc
 
         except Exception as e:
-            logger.error(f"Erro crítico ao carregar dados: {str(e)}", exc_info=True)
+            self.dados = None
+            self.frequencias = Counter()
+            self.engine_precisa_ativa = False
+            self.engine_precisa_erro = f"Erro ao carregar dados: {e}"
+            logger.critical(f"Erro crítico ao carregar dados: {e}", exc_info=True)
             return None
-        
+
     def preprocessar_dados(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Valida, normaliza e extrai colunas essenciais do DataFrame de concursos."""
         try:
-            required_cols = ['data'] + [f'B{i}' for i in range(1,16)]
+            required_cols = ['data'] + [f'B{i}' for i in range(1, 16)]
             if not all(col in df.columns for col in required_cols):
                 logger.error(f"Colunas obrigatórias faltantes. Esperado: {required_cols}")
                 return None
 
+            # Garante cópia independente para evitar SettingWithCopyWarning
+            df = df.copy()
+
+            # Conversão robusta da data
             try:
                 df['data'] = pd.to_datetime(df['data'], format='%Y-%m-%d', errors='raise')
             except Exception:
@@ -546,37 +575,45 @@ class BotLotofacil:
                 logger.warning(f"Linhas descartadas por data inválida: {df['data'].isnull().sum()}")
                 df = df.dropna(subset=['data'])
 
+            # Geração/Conversão de número do concurso
             if 'numero' in df.columns:
-                df['numero'] = df['numero'].astype(int)
+                df['numero'] = pd.to_numeric(df['numero'], errors='coerce').fillna(0).astype(int)
             elif 'concurso' in df.columns:
-                df['numero'] = df['concurso'].astype(int)
+                df['numero'] = pd.to_numeric(df['concurso'], errors='coerce').fillna(0).astype(int)
             else:
-                df['numero'] = range(1, len(df)+1)
+                df['numero'] = range(1, len(df) + 1)
 
+            # Conversão dos campos B1 a B15
             for i in range(1, 16):
-                df[f'B{i}'] = df[f'B{i}'].astype(int)
+                try:
+                    df[f'B{i}'] = pd.to_numeric(df[f'B{i}'], errors='coerce').fillna(0).astype(int)
+                except Exception as e:
+                    logger.error(f"Erro ao converter coluna B{i} para int: {e}")
+                    return None
 
+            # Ordenação
             if 'numero' in df.columns:
                 df = df.sort_values('numero').reset_index(drop=True)
             else:
                 df = df.sort_values('data').reset_index(drop=True)
 
+            # Cálculo dos números repetidos em concursos anteriores
             for rep in range(1, 6):
                 repetidos = []
                 for idx, row in df.iterrows():
                     if idx < rep:
                         repetidos.append(0)
                     else:
-                        nums_atual = {row[f'B{i}'] for i in range(1, 16)}
-                        nums_anterior = {df.iloc[idx - rep][f'B{i}'] for i in range(1, 16)}
-                        repetidos.append(len(nums_atual & nums_anterior))
+                        atual = {row[f'B{i}'] for i in range(1, 16)}
+                        anterior = {df.iloc[idx - rep][f'B{i}'] for i in range(1, 16)}
+                        repetidos.append(len(atual & anterior))
                 df[f'repetidos_{rep}'] = repetidos
 
-            cols_retorno = ['numero', 'data'] + [f'B{i}' for i in range(1,16)] + [f'repetidos_{j}' for j in range(1,6)]
+            cols_retorno = ['numero', 'data'] + [f'B{i}' for i in range(1, 16)] + [f'repetidos_{j}' for j in range(1, 6)]
             return df[cols_retorno]
 
         except Exception as e:
-            logger.error(f"Falha crítica no pré-processamento: {str(e)}\nDados recebidos:\n{df.head()}")
+            logger.error(f"Falha crítica no pré-processamento: {e}\nAmostra de dados:\n{df.head()}")
             return None
 
     def analisar_dados(self) -> None:
@@ -1331,7 +1368,7 @@ class BotLotofacil:
             for t in range(4):
                 try:
                     geradas = gerar_apostas_precisas(
-                         historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
+                        historico, quantidade=1, seed=seed + i*1543 + t*97, cfg=self.cfg_precisa
                     )
                     if geradas:
                         cand_list.append(sorted(set(map(int, geradas[0])))[:15])
@@ -1353,7 +1390,7 @@ class BotLotofacil:
             base_for_mut = cand_list[:]
             for ap in base_for_mut:
                 cand_list.append(self._mutacao_suave(ap, rng_global, cobertura_execucao,
-                                                 max_trocas=2, tol_score=3.0, p_aplicar=1.0))
+                                                     max_trocas=2, tol_score=3.0, p_aplicar=1.0))
 
             # 5) Reparo + filtros + pré-diversidade local
             candidatos_validos: List[List[int]] = []
@@ -1414,16 +1451,20 @@ class BotLotofacil:
 
         # 7) Cinturão final
         apostas_final = self._forca_diversidade_lote(apostas_tmp, MIN_DIFF, rng_global, cobertura_execucao)
-        apostas_final = self.diversificar_apostas(apostas_final)  # <-- MELHORIA ADICIONADA
+        apostas_final = self.diversificar_apostas(apostas_final)
 
-        # Log de métricas (MELHORIA ADICIONADA)
+        # Log de métricas (corrigido com proteção contra divisão por zero)
         pares = sum(1 for ap in apostas_final for n in ap if n % 2 == 0)
         impares = len(apostas_final)*15 - pares
         soma = sum(sum(ap) for ap in apostas_final) / len(apostas_final)
-        diferenca_media = sum(
-            15 - len(set(ap1) & set(ap2))
-            for ap1, ap2 in itertools.combinations(apostas_final, 2)
-        ) / (len(apostas_final)*(len(apostas_final)-1)/2)
+        n_ap = len(apostas_final)
+        if n_ap < 2:
+            diferenca_media = 0.0
+        else:
+            diferenca_media = sum(
+                15 - len(set(ap1) & set(ap2))
+                for ap1, ap2 in itertools.combinations(apostas_final, 2)
+            ) / (n_ap * (n_ap - 1) / 2)
 
         logger.info(
             f"Estatísticas pós-geração: "
@@ -1487,31 +1528,46 @@ class BotLotofacil:
             if col not in self.dados.columns:
                 raise RuntimeError(f"Coluna obrigatória ausente no histórico: {col}")
 
-    def _teste_engine_precisa_startup(self) -> bool:
+    def _teste_engine_precisa_startup(self) -> None:
+        """Executa um autoteste da engine precisa ao iniciar o sistema, com proteção de atributos."""
+        # Garante que os atributos existam antes do teste
+        if not hasattr(self, "engine_precisa_ativa"):
+            self.engine_precisa_ativa = True
+        if not hasattr(self, "engine_precisa_falhas"):
+            self.engine_precisa_falhas = 0
+        if not hasattr(self, "engine_precisa_erro"):
+            self.engine_precisa_erro = None
+
         try:
-            self._precheck_precisa()
-        
-            # Adiciona verificação de segurança para divisão
-            if len(self.dados) < 30:
-                raise RuntimeError("Histórico insuficiente (mínimo 30 concursos)")
-            
-            # Verifica se há dados suficientes para cálculo de estatísticas
-            required_cols = [f'B{i}' for i in range(1,16)]
-            if not all(col in self.dados.columns for col in required_cols):
-                raise RuntimeError("Colunas de dezenas ausentes")
-            
-            # Teste seguro de geração
             apostas = self.gerar_aposta_precisa(n_apostas=1, seed=42)  # Seed fixa para teste
-        
-            if not apostas or len(apostas[0]) != 15:
-                raise RuntimeError("Geração retornou aposta inválida")
-            
-            return True
-        
+
+            if (
+                not apostas
+                or not isinstance(apostas, list)
+                or not all(isinstance(a, list) and len(a) == 15 for a in apostas)
+            ):
+                self.engine_precisa_ativa = False
+                self.engine_precisa_falhas = getattr(self, "engine_precisa_falhas", 0) + 1
+                self.engine_precisa_erro = "geração inválida"
+                logger.warning("Engine precisa desativada após autoteste: geração inválida.")
+                return
+
+            self.engine_precisa_ativa = True
+            self.engine_precisa_erro = None
+            logger.info("Engine precisa testada com sucesso e permanece ativa.")
+
+        except ZeroDivisionError:
+            self.engine_precisa_ativa = False
+            self.engine_precisa_falhas = getattr(self, "engine_precisa_falhas", 0) + 1
+            self.engine_precisa_erro = "float division by zero"
+            logger.warning("Engine precisa desativada após autoteste: float division by zero.")
+
         except Exception as e:
-            logger.error(f"Falha no teste do engine preciso: {str(e)}", exc_info=True)
-            raise
-     
+            self.engine_precisa_ativa = False
+            self.engine_precisa_falhas = getattr(self, "engine_precisa_falhas", 0) + 1
+            self.engine_precisa_erro = str(e)
+            logger.warning(f"Engine precisa desativada após autoteste: {e}")
+
     # -------------------------
     # Outras utilidades
     # -------------------------
@@ -1929,35 +1985,61 @@ def comando_atualizar(update: Update, context: CallbackContext) -> None:
 def comando_status(update: Update, context: CallbackContext) -> None:
     if not rate_limit(update, "status"):
         return
-    if bot.dados is None or len(bot.dados) == 0:
-        update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
-        logger.error("Dados indisponíveis ao tentar verificar status do sistema.")
-        return
+
     try:
+        if bot.dados is None or len(bot.dados) == 0:
+            update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
+            logger.error("Dados indisponíveis ao tentar verificar status do sistema.")
+            return
+
         ultimo = bot.dados.loc[bot.dados['data'].idxmax()]
-        precise_state = "✅ Ativo" if getattr(bot, "precise_enabled", False) else "❌ Desativado"
-        precise_fail = getattr(bot, "precise_fail_count", 0)
-        precise_err  = getattr(bot, "precise_last_error", None)
+        total_concursos = len(bot.dados)
+
+        engine_status = (
+            "✅ Ativa"
+            if getattr(bot, "engine_precisa_ativa", False)
+            else f"❌ Inativa ({getattr(bot, 'engine_precisa_erro', 'erro desconhecido')})"
+        )
+        engine_falhas = getattr(bot, "engine_precisa_falhas", 0)
+        engine_erro = getattr(bot, "engine_precisa_erro", None)
+
+        modelo_status = (
+            "Carregado"
+            if hasattr(bot, "modelo") and bot.modelo is not None
+            else "Não treinado"
+        )
+
+        ultima_aposta = (
+            bot.ultima_geracao_precisa[-1]
+            if getattr(bot, "ultima_geracao_precisa", None)
+            else "N/A"
+        )
 
         status = (
             "<b>📊 Status do Sistema</b>\n\n"
-            f"<b>Concursos carregados:</b> {len(bot.dados)}\n"
+            f"<b>Concursos carregados:</b> {total_concursos}\n"
             f"<b>Último concurso:</b> {ultimo['numero']} ({ultimo['data'].strftime('%d/%m/%Y')})\n"
-            f"<b>Modelo IA:</b> {'Carregado' if hasattr(bot, 'modelo') and bot.modelo is not None else 'Não treinado'}\n"
-            f"<b>Engine precisa:</b> {precise_state} | Falhas recentes: {precise_fail}\n"
+            f"<b>Modelo IA:</b> {modelo_status}\n"
+            f"<b>Engine precisa:</b> {engine_status} | Falhas acumuladas: {engine_falhas}\n"
         )
-        if precise_err:
-            status += f"<b>Último erro:</b> {precise_err[:200]}{'...' if len(precise_err) > 200 else ''}\n"
 
-        status += (
-            f"\n<b>Números mais quentes:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common(3))}\n"
-            f"<b>Números mais frios:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common()[-3:])}"
-        )
+        if engine_erro:
+            status += f"<b>Último erro:</b> {engine_erro[:200]}{'...' if len(engine_erro) > 200 else ''}\n"
+
+        if hasattr(bot, "frequencias") and isinstance(bot.frequencias, Counter):
+            status += (
+                f"\n<b>Números mais quentes:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common(3))}\n"
+                f"<b>Números mais frios:</b> {', '.join(str(n) for n, _ in bot.frequencias.most_common()[-3:])}\n"
+            )
+
+        status += f"\n<b>Última aposta gerada:</b> {ultima_aposta}"
 
         update.message.reply_text(status, parse_mode='HTML')
+
     except Exception as e:
         logger.error(f"Erro ao verificar status: {str(e)}")
         update.message.reply_text("❌ Ocorreu um erro ao verificar o status. Tente novamente.")
+
 
 @apenas_admin
 def comando_inserir(update, context):
@@ -2273,11 +2355,9 @@ def main() -> None:
     """Função principal do bot com monitoramento de recursos completo."""
     # Configuração inicial segura
     try:
-        # Verifica/Cria diretórios necessários
         os.makedirs("backups", exist_ok=True)
         os.makedirs("cache", exist_ok=True)
-        
-        # Verifica permissões de arquivos críticos
+
         arquivos_necessarios = ['lotofacil_historico.csv', 'whitelist.txt']
         for arquivo in arquivos_necessarios:
             if os.path.exists(arquivo):
@@ -2287,16 +2367,14 @@ def main() -> None:
                 logger.warning(f"Arquivo {arquivo} não encontrado - criando vazio")
                 open(arquivo, 'a').close()
                 verificar_e_corrigir_permissoes_arquivo(arquivo)
-                
+
     except Exception as e:
         logger.critical(f"Falha na configuração inicial: {str(e)}")
         sys.exit(1)
 
     try:
-        # Ativa timeout global (2 minutos para inicialização)
-        signal.alarm(120)
+        signal.alarm(120)  # Timeout de 2 minutos
 
-        # 1. Inicialização robusta do Updater
         updater = None
         try:
             updater = Updater(
@@ -2310,18 +2388,14 @@ def main() -> None:
             logger.critical(f"Falha na inicialização do Updater: {str(e)}")
             raise
 
-        # 2. Configuração avançada do sistema de monitoramento
         jq = updater.job_queue if updater else None
         if jq:
-            # Monitoramento principal com tratamento de erros
             try:
                 jq.run_repeating(
                     callback=ResourceMonitor.log_resource_usage,
                     interval=1800,
                     first=10
                 )
-                
-                # Teste rápido do sistema
                 jq.run_once(
                     lambda ctx: logger.info("✅ Teste inicial do monitoramento concluído com sucesso"),
                     when=5
@@ -2332,25 +2406,20 @@ def main() -> None:
         else:
             logger.warning("JobQueue indisponível - monitoramento de recursos desativado")
 
-        # 3. Verificação completa de saúde inicial
         try:
             stats = ResourceMonitor.get_system_stats()
-            if not stats:
-                logger.warning("Coleta inicial de recursos retornou vazia")
-            else:
-                # Verificação crítica de recursos
+            if stats:
                 alerta = ""
                 if stats['mem_percent'] > _MAX_MEMORY_ALERT:
                     alerta = f" ⚠️ Memória alta: {stats['mem_percent']:.1f}%"
                 if stats['disk_percent'] > 90:
                     alerta += f" ⚠️ Disco quase cheio: {stats['disk_percent']:.1f}%"
-                
-                status = f"Teste de saúde OK - Memória: {stats['mem_percent']:.1f}%{alerta}"
-                logger.info(status)
+                logger.info(f"Teste de saúde OK - Memória: {stats['mem_percent']:.1f}%{alerta}")
+            else:
+                logger.warning("Coleta inicial de recursos retornou vazia")
         except Exception as e:
             logger.error(f"Falha no teste inicial do monitoramento: {str(e)}")
 
-        # 4. Registro seguro dos handlers de comandos
         handlers = [
             CommandHandler("start", start),
             CommandHandler("meuid", comando_meuid),
@@ -2363,24 +2432,34 @@ def main() -> None:
             CommandHandler("autorizar", comando_autorizar),
             CommandHandler("remover", comando_remover)
         ]
-
         for handler in handlers:
             try:
                 dp.add_handler(handler)
             except Exception as e:
                 logger.error(f"Falha ao registrar handler {handler.callback.__name__}: {str(e)}")
 
-        # 5. Configuração reforçada do handler de erros
         dp.add_error_handler(error_handler)
 
-        # 6. Inicialização segura do bot
+        # ⬇️ Inicialização da IA e da engine precisa
+        bot.ultima_execucao = None
+        bot.engine_precisa_ativa = True
+        bot.engine_precisa_falhas = 0
+        bot.engine_precisa_erro = None
+        bot.ultima_geracao_precisa = []
+
+        if hasattr(bot, "carregar_dados"):
+            bot.carregar_dados()
+
+        if hasattr(bot, "_teste_engine_precisa_startup"):
+            bot._teste_engine_precisa_startup()
+
         logger.info("Iniciando bot com verificações de recursos...")
         try:
             updater.start_polling(
                 poll_interval=0.5,
                 timeout=15,
                 drop_pending_updates=True,
-                bootstrap_retries=3  # Tentativas adicionais de conexão
+                bootstrap_retries=3
             )
         except Exception as e:
             logger.critical(f"Falha no start_polling: {str(e)}")
@@ -2394,7 +2473,6 @@ def main() -> None:
             f"• Timeouts: {REQUEST_KWARGS['connect_timeout']}s connect, {REQUEST_KWARGS['read_timeout']}s read"
         )
 
-        # Desativa timeout após inicialização bem-sucedida
         signal.alarm(0)
         updater.idle()
 
@@ -2420,9 +2498,8 @@ def main() -> None:
         sys.exit(1)
     finally:
         logger.info("Encerrando processo do bot...")
-        signal.alarm(0)  # Garante que o timeout seja cancelado
-        
-        # Limpeza segura dos recursos
+        signal.alarm(0)
+
         try:
             if 'updater' in locals() and updater:
                 updater.stop()
@@ -2430,8 +2507,7 @@ def main() -> None:
                 logger.info("Updater parado com sucesso")
         except Exception as e:
             logger.error(f"Erro ao parar updater: {str(e)}")
-        
-        # Limpeza de cache e recursos do TensorFlow
+
         try:
             if 'bot' in globals():
                 if hasattr(bot, 'modelo'):
@@ -2450,6 +2526,8 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
+
 
 
 
