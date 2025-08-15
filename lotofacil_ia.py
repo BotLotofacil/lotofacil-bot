@@ -81,19 +81,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Função utilitária segura de envio
-from telegram.error import TelegramError
 from telegram.ext import CallbackContext
-
-async def safe_send_message(
-    context: CallbackContext,
-    chat_id: int,
-    text: str,
-    **kwargs
-) -> None:
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    except TelegramError as e:
-        logger.error(f"Erro ao enviar mensagem para {chat_id}: {e}")
 
 # Terceiros
 import requests
@@ -220,13 +208,7 @@ def verificar_e_corrigir_permissoes_arquivo(caminho: str) -> bool:
     except Exception as e:
         logger.error(f"Falha ao verificar permissões de {caminho}: {str(e)}")
         return False
-
-class SecurityManager:
-    def __init__(self) -> None:
-        self.whitelist: Set[int] = set()
-        self.admins: Set[int] = set(ADMIN_USER_IDS)
-        self.load_whitelist()
-
+        
     def load_whitelist(self, file: str = "whitelist.txt") -> None:
         try:
             if os.path.exists(file):
@@ -321,8 +303,8 @@ class ResourceMonitor:
             return {}
 
     @staticmethod
-    def log_resource_usage(context: CallbackContext) -> None:
-        """Log detalhado com alertas condicionais."""
+    async def log_resource_usage(context: CallbackContext) -> None:
+        """Log detalhado com alertas condicionais (async para poder notificar admins)."""
         stats = ResourceMonitor.get_system_stats()
         if not stats:
             return
@@ -346,14 +328,13 @@ class ResourceMonitor:
         if alert and hasattr(context, 'bot') and ADMIN_USER_IDS:
             for admin_id in ADMIN_USER_IDS:
                 try:
-                    context.bot.send_message(
+                    await context.bot.send_message(
                         chat_id=admin_id,
                         text=f"🚨 ALERTA DE RECURSOS\n{message}",
                         parse_mode='HTML'
                     )
                 except Exception as e:
                     logger.error(f"Falha ao enviar alerta para admin {admin_id}: {str(e)}")
-
 class DataFetcher:
     """Obtém último resultado da Lotofácil com fallback entre fontes."""
     API_URLS = [
@@ -539,19 +520,7 @@ class BotLotofacil:
         except Exception as e:
             logger.critical(f"Falha crítica no fallback serial: {str(e)}")
             raise RuntimeError("Não foi possível gerar apostas")
-
-    async def _fallback_serial(self, n_apostas: int) -> List[List[int]]:
-        """Fallback serial para quando o paralelismo falha"""
-        logger.warning("Usando fallback serial para geração de apostas")
-        try:
-            apostas = []
-            for _ in range(n_apostas):
-                apostas.append(self.gerar_aposta_precisa_com_retry(1)[0])
-            return apostas
-        except Exception as e:
-            logger.critical(f"Falha crítica no fallback serial: {str(e)}")
-            raise RuntimeError("Não foi possível gerar apostas")
-     
+            
     # -------------------------
     # Dados / preparação
     # -------------------------
@@ -1893,7 +1862,8 @@ bot = None  # será atribuído em main()
 def apenas_admin(func):
     async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
         try:
-            if not context.bot.security.is_admin(update.effective_user.id):
+            global bot
+            if not bot or not bot.security.is_admin(update.effective_user.id):
                 await update.message.reply_text("❌ Comando restrito ao administrador.")
                 return
             return await func(update, context, *args, **kwargs)
@@ -1905,7 +1875,8 @@ def apenas_admin(func):
 def somente_autorizado(func):
     async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
         try:
-            if not context.bot.security.is_authorized(update.effective_user.id):
+            global bot
+            if not bot or not bot.security.is_authorized(update.effective_user.id):
                 await update.message.reply_text("❌ Você não tem permissão para usar este bot.")
                 return
             return await func(update, context, *args, **kwargs)
@@ -1928,6 +1899,22 @@ async def start(update: Update, context: CallbackContext) -> None:
         "Para solicitar acesso, use o comando /meuid e envie o ID ao administrador do bot.",
         parse_mode='HTML'
     )
+
+# Helpers de progresso (simples)
+async def _start_progress(context: CallbackContext, chat_id: int):
+    """Envia mensagem de progresso (simples) e retorna (msg, job=None)."""
+    msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Gerando suas apostas…")
+    return msg, None
+
+async def _stop_progress(job, msg, final_text: str):
+    """Finaliza mensagem de progresso."""
+    try:
+        if job:
+            job.schedule_removal()
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        await msg.edit_text(final_text)
 
 @somente_autorizado
 async def comando_aposta(update: Update, context: CallbackContext) -> None:
@@ -1953,7 +1940,8 @@ async def comando_aposta(update: Update, context: CallbackContext) -> None:
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
         n_apostas = max(1, min(n_apostas, 10))
 
-        cached = context.bot.get_cached_apostas(user_id, n_apostas)
+        # >>> TROCAS AQUI: context.bot.* -> bot.* <<<
+        cached = bot.get_cached_apostas(user_id, n_apostas)
         if cached:
             logger.info(f"Cache hit para {user_id} ({n_apostas} apostas)")
             await enviar_apostas(context, chat_id, cached, "cache")
@@ -1961,10 +1949,10 @@ async def comando_aposta(update: Update, context: CallbackContext) -> None:
 
         progress_msg, progress_job = await _start_progress(context, chat_id)
 
-        apostas = context.bot.gerar_apostas_paralelo(n_apostas)
+        apostas = bot.gerar_apostas_paralelo(n_apostas)
         engine_label = "paralelo"
 
-        context.bot.set_cached_apostas(user_id, apostas)
+        bot.set_cached_apostas(user_id, apostas)
         await enviar_apostas(context, chat_id, apostas, engine_label)
 
     except TimeoutError:
@@ -1982,6 +1970,7 @@ async def comando_aposta(update: Update, context: CallbackContext) -> None:
                 progress_job.schedule_removal()
         if progress_msg:
             await _stop_progress(progress_job, progress_msg, "✅ Finalizado")
+
             
 async def enviar_apostas(context: CallbackContext, chat_id: int, apostas: List[List[int]], fonte: str) -> None:
     """Função auxiliar para envio padronizado."""
@@ -1995,109 +1984,12 @@ async def enviar_apostas(context: CallbackContext, chat_id: int, apostas: List[L
     await safe_send_message(context, chat_id, mensagem)
 
 @somente_autorizado
-async def comando_tendencia(update: Update, context: CallbackContext) -> None:
-    if not await rate_limit(update, "tendencia"):
-        return
-
-    if context.bot.dados is None or len(context.bot.dados) == 0:
-        await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
-        logger.error("Dados indisponíveis ao tentar gerar aposta de tendência.")
-        return
-
-    try:
-        aposta = context.bot.gerar_aposta_tendencia()
-        pares = sum(1 for n in aposta if n % 2 == 0)
-        soma = sum(aposta)
-        mensagem = (
-            "📈 <b>Aposta Baseada em Tendências</b>\n\n"
-            f"<b>Números:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
-            f"Pares: {pares} | Ímpares: {15 - pares} | Soma: {soma}\n\n"
-            "<i>Estratégia: Combina números quentes (últimos sorteios) e frios (ausentes)</i>"
-        )
-        await update.message.reply_text(mensagem, parse_mode='HTML')
-
-    except Exception as e:
-        logger.error(f"Erro ao gerar aposta de tendência: {str(e)}")
-        await update.message.reply_text("❌ Ocorreu um erro ao gerar a aposta. Tente novamente.")
-
-@somente_autorizado
-async def comando_analise(update: Update, context: CallbackContext) -> None:
-    if not await rate_limit(update, "analise"):
-        return
-
-    if context.bot.dados is None or len(context.bot.dados) == 0:
-        await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
-        logger.error("Dados indisponíveis ao tentar gerar análise estatística.")
-        return
-
-    try:
-        grafico = context.bot.gerar_grafico_frequencia()
-        await update.message.reply_photo(photo=InputFile(grafico), caption='Frequência dos números na Lotofácil')
-
-        freq_completa = [(n, context.bot.frequencias.get(n, 0)) for n in range(1, 26)]
-        freq_ordenada = sorted(freq_completa, key=lambda x: (x[1], x[0]))
-        menos_frequentes = [str(n) for n, _ in freq_ordenada[:5]]
-        mais_frequentes = [str(n) for n, _ in sorted(freq_completa, key=lambda x: (-x[1], x[0]))[:5]]
-
-        mensagem = (
-            "<b>📊 Estatísticas Avançadas</b>\n\n"
-            f"<b>Números mais frequentes:</b> {', '.join(mais_frequentes)}\n"
-            f"<b>Números menos frequentes:</b> {', '.join(menos_frequentes)}\n\n"
-            "<b>Clusters identificados:</b>\n"
-        )
-        for cluster, nums in context.bot.clusters.items():
-            mensagem += f"Cluster {cluster}: {', '.join(str(n) for n in sorted(nums))}\n"
-
-        await update.message.reply_text(mensagem, parse_mode='HTML')
-
-    except Exception as e:
-        logger.error(f"Erro ao gerar análise: {str(e)}")
-        await update.message.reply_text("❌ Ocorreu um erro ao gerar a análise. Tente novamente.")
-
-@apenas_admin
-async def comando_atualizar(update: Update, context: CallbackContext) -> None:
-    await update.message.reply_text("🔄 Atualizando dados... Isso pode demorar alguns minutos.")
-
-    try:
-        context.bot.dados = context.bot.carregar_dados(atualizar=True)
-        if context.bot.dados is None or len(context.bot.dados) == 0:
-            await update.message.reply_text("❌ Falha ao atualizar dados. Nenhum dado foi carregado.")
-            logger.error("Falha ao atualizar dados: Nenhum dado foi carregado.")
-            return
-
-        context.bot.analisar_dados()
-        context.bot.modelo = context.bot.construir_modelo()
-
-        try:
-            context.bot._teste_engine_precisa_startup()
-            context.bot.precise_enabled = True
-            context.bot.precise_fail_count = 0
-            context.bot.precise_last_error = None
-
-            await update.message.reply_text("✅ Dados e modelo atualizados com sucesso! Engine precisa revalidado e ATIVO.")
-        except Exception as e:
-            context.bot.precise_enabled = False
-            context.bot.precise_last_error = str(e)
-
-            await update.message.reply_text(
-                "✅ Dados e modelo atualizados.\n"
-                f"⚠️ Engine precisa desativado após reteste: {e}"
-            )
-            logger.warning(f"Engine precisa desativado após atualizar: {e}")
-
-    except Exception as e:
-        logger.error(f"Erro ao atualizar dados: {str(e)}")
-        await update.message.reply_text("❌ Falha ao atualizar dados. Verifique os logs.")
-
-
-@somente_autorizado
 async def comando_status(update: Update, context: CallbackContext) -> None:
     if not await rate_limit(update, "status"):
         return
 
+    global bot
     try:
-        bot = context.bot
-
         if not hasattr(bot, "dados") or bot.dados is None or len(bot.dados) == 0:
             await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
             logger.error("Dados indisponíveis ao tentar verificar status do sistema.")
@@ -2151,6 +2043,102 @@ async def comando_status(update: Update, context: CallbackContext) -> None:
     except Exception as e:
         logger.error(f"Erro ao verificar status: {str(e)}")
         await update.message.reply_text("❌ Ocorreu um erro ao verificar o status. Tente novamente.")
+
+
+@somente_autorizado
+async def comando_analise(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "analise"):
+        return
+
+    global bot
+    # Checagem rápida de prontidão do core (não bloqueante)
+    if not bot or not bot.is_ready(timeout=0):
+        await update.message.reply_text("⚠️ O bot ainda está inicializando. Por favor, aguarde…")
+        return
+
+    if bot.dados is None or len(bot.dados) == 0:
+        await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
+        logger.error("Dados indisponíveis ao tentar gerar análise estatística.")
+        return
+
+    try:
+        # Gráfico de frequência
+        grafico = bot.gerar_grafico_frequencia()
+        await update.message.reply_photo(photo=InputFile(grafico), caption="Frequência dos números na Lotofácil")
+
+        # Estatísticas de frequência
+        freq_completa = [(n, bot.frequencias.get(n, 0)) for n in range(1, 26)]
+        freq_ordenada = sorted(freq_completa, key=lambda x: (x[1], x[0]))
+        menos_frequentes = [str(n) for n, _ in freq_ordenada[:5]]
+        mais_frequentes = [str(n) for n, _ in sorted(freq_completa, key=lambda x: (-x[1], x[0]))[:5]]
+
+        mensagem = (
+            "<b>📊 Estatísticas Avançadas</b>\n\n"
+            f"<b>Números mais frequentes:</b> {', '.join(mais_frequentes)}\n"
+            f"<b>Números menos frequentes:</b> {', '.join(menos_frequentes)}\n\n"
+            "<b>Clusters identificados:</b>\n"
+        )
+        for cluster, nums in bot.clusters.items():
+            mensagem += f"Cluster {cluster}: {', '.join(str(n) for n in sorted(nums))}\n"
+
+        await update.message.reply_text(mensagem, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Erro ao gerar análise: {str(e)}")
+        await update.message.reply_text("❌ Ocorreu um erro ao gerar a análise. Tente novamente.")
+
+@somente_autorizado
+async def comando_tendencia(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "tendencia"):
+        return
+
+    global bot
+    # Checagem rápida de prontidão do core (não bloqueante)
+    if not bot or not bot.is_ready(timeout=0):
+        await update.message.reply_text("⚠️ O bot ainda está inicializando. Por favor, aguarde…")
+        return
+
+    try:
+        aposta = bot.gerar_aposta_tendencia()
+        await enviar_apostas(context, update.effective_chat.id, [aposta], "tendência")
+    except Exception as e:
+        logger.error(f"Erro em comando_tendencia: {str(e)}", exc_info=True)
+        await safe_send_message(context, update.effective_chat.id, "❌ Ocorreu um erro ao gerar a aposta de tendência.")
+
+@apenas_admin
+async def comando_atualizar(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text("🔄 Atualizando dados... Isso pode demorar alguns minutos.")
+
+    global bot
+    try:
+        bot.dados = bot.carregar_dados(atualizar=True)
+        if bot.dados is None or len(bot.dados) == 0:
+            await update.message.reply_text("❌ Falha ao atualizar dados. Nenhum dado foi carregado.")
+            logger.error("Falha ao atualizar dados: Nenhum dado foi carregado.")
+            return
+
+        bot.analisar_dados()
+        bot.modelo = bot.construir_modelo()
+
+        try:
+            bot._teste_engine_precisa_startup()
+            bot.precise_enabled = True
+            bot.precise_fail_count = 0
+            bot.precise_last_error = None
+
+            await update.message.reply_text("✅ Dados e modelo atualizados com sucesso! Engine precisa revalidado e ATIVO.")
+        except Exception as e:
+            bot.precise_enabled = False
+            bot.precise_last_error = str(e)
+            await update.message.reply_text(
+                "✅ Dados e modelo atualizados.\n"
+                f"⚠️ Engine precisa desativado após reteste: {e}"
+            )
+            logger.warning(f"Engine precisa desativado após atualizar: {e}")
+
+    except Exception as e:
+        logger.error(f"Erro ao atualizar dados: {str(e)}")
+        await update.message.reply_text("❌ Falha ao atualizar dados. Verifique os logs.")
 
 @apenas_admin
 async def comando_inserir(update: Update, context: CallbackContext) -> None:
@@ -2537,6 +2525,7 @@ if __name__ == '__main__':
         main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
 
 
 
