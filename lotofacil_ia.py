@@ -24,11 +24,32 @@ import warnings
 from typing import Optional, Dict, List, Tuple, Set
 from threading import Lock
 
+# (opcional para dev/local) .env
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv (para uso local)
+    load_dotenv()
+except Exception:
+    pass
+    
 # leitura direta da variável
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+def _get_bot_token() -> Optional[str]:
+    """
+    Busca o token em múltiplos nomes comuns e .env.
+    Não loga o valor do token. Retorna None se não encontrar.
+    """
+    for key in (
+        "TELEGRAM_BOT_TOKEN",
+        "BOT_TOKEN",
+        "TOKEN",
+        "RAILWAY_TELEGRAM_BOT_TOKEN",
+    ):
+        val = os.getenv(key)
+        if val and val.strip():
+            return val.strip()
+    return None
 
-if not TOKEN:
-    raise RuntimeError("Variável TELEGRAM_BOT_TOKEN não encontrada. Verifique as configurações no Railway.")
+# NÃO LEIA/VALIDE O TOKEN AQUI NO IMPORT.
+# A validação ocorrerá no main().
 
 # Configuração segura do psutil
 try:
@@ -2430,12 +2451,19 @@ async def main() -> None:
         sys.exit(1)
 
     # 2. CONSTRUÇÃO DA APLICAÇÃO
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TOKEN = _get_bot_token()
     if not TOKEN:
-        logger.critical("TOKEN do Telegram não encontrado na variável de ambiente TELEGRAM_BOT_TOKEN")
+        # Mostra CHAVES semelhantes presentes para depuração, sem expor valores
+        env_keys = [k for k in os.environ.keys() if "TOKEN" in k or "TELEGRAM" in k]
+        logger.critical(
+            "Token do Telegram não encontrado nas variáveis de ambiente. "
+            "Procure configurar TELEGRAM_BOT_TOKEN (ou BOT_TOKEN/TOKEN). "
+            f"Chaves relacionadas detectadas no ambiente: {env_keys}"
+        )
         sys.exit(1)
 
     application = ApplicationBuilder().token(TOKEN).build()
+
 
     # 3. INICIALIZAÇÃO DO BOT (global)
     global bot
@@ -2492,6 +2520,7 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
 
 
 
