@@ -10,6 +10,7 @@ import traceback
 import contextlib
 import shutil
 import pickle
+import asyncio
 import random
 import gc
 import itertools
@@ -43,26 +44,26 @@ os.environ['OMP_NUM_THREADS'] = '1'
 # ThreadPool global para operações paralelas
 _GLOBAL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="aposta_")
 
-def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwargs) -> None:
-    """Envio seguro de mensagens com tratamento de timeout"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=kwargs.get('parse_mode', 'HTML'),
-                timeout=10 * (attempt + 1)
-            )
-            return
-        except telegram.error.TimedOut:
-            if attempt == max_retries - 1:
-                logger.error(f"Falha ao enviar mensagem após {max_retries} tentativas")
-                raise
-            time.sleep(1)
-        except Exception as e:
-            logger.error(f"Erro ao enviar mensagem: {str(e)}")
-            raise
+async def safe_send_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    **kwargs
+) -> None:
+    """
+    Envia uma mensagem com segurança para o chat especificado, tratando erros do Telegram.
+    Compatível com python-telegram-bot v20+ (async).
+
+    Args:
+        context (ContextTypes.DEFAULT_TYPE): Contexto da atualização.
+        chat_id (int): ID do chat para onde a mensagem será enviada.
+        text (str): Texto da mensagem.
+        **kwargs: Parâmetros adicionais para context.bot.send_message.
+    """
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except TelegramError as e:
+        logger.error(f"Erro ao enviar mensagem para {chat_id}: {e}")
 
 # ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
@@ -168,6 +169,45 @@ signal.signal(signal.SIGALRM, handler)  # Configura o handler
 
 # ==== fim helpers ====
 
+# ================================
+# CONTROLE ASSÍNCRONO POR USUÁRIO (SEM BLOQUEIO GLOBAL)
+# ================================
+
+# Substitui o uso de threading.Lock() global, que causava bloqueios em execuções simultâneas
+user_locks = defaultdict(asyncio.Lock)
+
+# Função assíncrona de geração de apostas (exemplo básico — substitua pela lógica real)
+async def gerar_aposta_para_usuario(user_id: int) -> List[int]:
+    async with user_locks[user_id]:
+        # Exemplo: Gera 15 dezenas aleatórias entre 1 e 25 (sem repetição)
+        aposta = random.sample(range(1, 26), 15)
+        aposta.sort()
+        return aposta
+
+# Handler assíncrono para o comando /aposta
+async def handler_aposta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # Inicia barra de progresso (mensagem + job)
+    progress_msg, job = _start_progress(context, chat_id)
+
+    try:
+        # Gera a aposta com bloqueio assíncrono por usuário
+        aposta = await gerar_aposta_para_usuario(user_id)
+
+        # Monta a resposta formatada
+        dezenas_str = " ".join(f"{dez:02d}" for dez in aposta)
+        texto_final = f"✅ <b>Sua aposta está pronta:</b>\n{dezenas_str}"
+
+        # Atualiza a mensagem de progresso com o resultado
+        _stop_progress(job, progress_msg, texto_final)
+
+    except Exception as e:
+        logger.exception("Erro durante a geração de aposta")
+        _stop_progress(job, progress_msg, "⚠️ Erro ao gerar sua aposta. Tente novamente.")
+
+        
 # ================================
 # Bloco 2 — Constantes & Bootstrap
 # ================================
@@ -2678,15 +2718,18 @@ def main() -> None:
         except Exception as e:
             logger.error(f"Erro na limpeza de recursos: {str(e)}")
 
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Bot encerrado pelo usuário")
-        sys.exit(0)
-    except SystemExit as e:
-        logger.error(f"Bot encerrado com código {e.code}")
-        raise
+if __name__ == '__main__':
+    # Token do bot
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+    # Construção da aplicação (PTB v20+)
+    application = Application.builder().token(TOKEN).build()
+
+    # Registro do handler para o comando /aposta
+    application.add_handler(CommandHandler("aposta", handler_aposta))
+
+    # Execução do bot
+    application.run_polling()
 
 
 
