@@ -7,6 +7,7 @@ import os
 import sys
 import signal 
 import traceback
+import contextlib
 import shutil
 import pickle
 import random
@@ -15,6 +16,7 @@ import itertools
 from io import BytesIO
 from datetime import datetime
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import warnings
 from typing import Optional, Dict, List, Tuple, Set
@@ -27,6 +29,12 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
     logging.warning("psutil não instalado - monitoramento desativado")
+
+# ---- Locks específicos (NOVO BLOCO ADICIONADO) ----
+_MODEL_LOCK = Lock()    # Para operações com o modelo LSTM
+_DATA_LOCK = Lock()     # Para acesso aos dados históricos
+_CACHE_LOCK = Lock()    # Para operações de cache
+_RESOURCE_LOCK = Lock() # Mantido para compatibilidade (será removido gradualmente)
 
 # ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
@@ -317,35 +325,44 @@ class SecurityManager:
         return user_id in self.whitelist or self.is_admin(user_id)
 
 class ResourceMonitor:
-    """Monitoramento avançado de recursos do sistema."""
+    """Monitoramento otimizado com locks seletivos e métricas essenciais"""
+    
     @staticmethod
     def get_system_stats() -> Dict[str, float]:
+        """Coleta métricas com mínimo bloqueio e mantém compatibilidade"""
         if not PSUTIL_AVAILABLE:
             return {}
-            
-        with _RESOURCE_LOCK:
-            try:
-                mem = psutil.virtual_memory()
-                swap = psutil.swap_memory()
-                cpu = psutil.cpu_percent(interval=1)
+
+        try:
+            # Métricas que não precisam de lock
+            mem = psutil.virtual_memory()
+            stats = {
+                'cpu_percent': psutil.cpu_percent(interval=0.5),  # Balanceamento precisão/performance
+                'mem_total': mem.total / (1024 ** 3),  # GB (mantido para compatibilidade)
+                'mem_used': mem.used / (1024 ** 3),    # GB
+                'mem_percent': mem.percent,
+                'process_mem': psutil.Process().memory_info().rss / (1024 ** 2)  # MB
+            }
+
+            # Operações críticas com lock mínimo
+            with _RESOURCE_LOCK:
                 disk = psutil.disk_usage('/')
+                swap = psutil.swap_memory()
                 net_io = psutil.net_io_counters()
                 
-                return {
-                    'cpu_percent': cpu,
-                    'mem_total': mem.total / (1024 ** 3),  # GB
-                    'mem_used': mem.used / (1024 ** 3),
-                    'mem_percent': mem.percent,
-                    'swap_used': swap.used / (1024 ** 3),
-                    'disk_used': disk.used / (1024 ** 3),
+                stats.update({
+                    'disk_used': disk.used / (1024 ** 3),  # GB
                     'disk_percent': disk.percent,
+                    'swap_used': swap.used / (1024 ** 3),  # GB
                     'bytes_sent': net_io.bytes_sent / (1024 ** 2),  # MB
-                    'bytes_recv': net_io.bytes_recv / (1024 ** 2),
-                    'process_mem': psutil.Process().memory_info().rss / (1024 ** 2)  # MB
-                }
-            except Exception as e:
-                logger.error(f"Erro ao coletar métricas: {str(e)}")
-                return {}
+                    'bytes_recv': net_io.bytes_recv / (1024 ** 2)   # MB
+                })
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Falha no monitoramento: {str(e)}", exc_info=True)
+            return {}
 
     @staticmethod
     def log_resource_usage(context: CallbackContext) -> None:
@@ -448,6 +465,11 @@ class BotLotofacil:
         self.precise_fail_count: int = 0
         self.precise_last_error: Optional[str] = None
 
+        # Sistema de cache em memória
+        self._aposta_cache = {}      # Dicionário para armazenar apostas
+        self._cache_expiry = {}      # Tempo de expiração do cache
+        # self._cache_lock já definido globalmente
+        
         # Autoteste simples no startup
         try:
             _ = self._teste_engine_precisa_startup()
@@ -460,6 +482,49 @@ class BotLotofacil:
             self.precise_last_error = str(e)
             logger.warning(f"Engine precisa desativado no startup: {e}")
 
+    def get_cached_apostas(self, user_id: int, n_apostas: int) -> Optional[List[List[int]]]:
+        """Obtém apostas do cache se disponíveis e válidas"""
+        with _CACHE_LOCK:
+            cached = self._aposta_cache.get(user_id)
+            expiry = self._cache_expiry.get(user_id, 0)
+            
+            if cached and time.time() < expiry:
+                logger.debug(f"Cache HIT para usuário {user_id}")
+                return cached[:n_apostas]
+            logger.debug(f"Cache MISS para usuário {user_id}")
+            return None
+
+    def set_cached_apostas(self, user_id: int, apostas: List[List[int]], ttl: int = 30) -> None:
+        """Armazena apostas no cache com tempo de vida (TTL) em segundos"""
+        with _CACHE_LOCK:
+            self._aposta_cache[user_id] = apostas
+            self._cache_expiry[user_id] = time.time() + ttl
+            logger.debug(f"Cache SET para usuário {user_id} (TTL: {ttl}s)") 
+
+    def gerar_apostas_paralelo(self, n_apostas: int = 5, n_workers: int = 4) -> List[List[int]]:
+        """
+        Gera apostas em paralelo usando ThreadPoolExecutor.
+        
+        Args:
+            n_apostas: Quantidade de apostas a gerar
+            n_workers: Número de threads paralelas (recomendado 2-4)
+            
+        Returns:
+            Lista de apostas geradas
+        """
+        if not hasattr(self, 'gerar_aposta_precisa_com_retry'):
+            logger.error("Método gerar_aposta_precisa_com_retry não disponível")
+            return self.gerar_aposta(n_apostas)  # Fallback seguro
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(n_workers, 4)) as executor:
+                futures = [executor.submit(self.gerar_aposta_precisa_com_retry, 1) for _ in range(n_apostas)]
+                return [f.result()[0] for f in futures]
+                
+        except Exception as e:
+            logger.error(f"Falha na geração paralela: {str(e)}")
+            return self.gerar_aposta(n_apostas)  # Fallback para versão serial
+     
     # -------------------------
     # Dados / preparação
     # -------------------------
@@ -1818,83 +1883,74 @@ def start(update: Update, context: CallbackContext) -> None:
 
 @somente_autorizado
 def comando_aposta(update: Update, context: CallbackContext) -> None:
-    """Versão robusta do comando /aposta com tratamento completo de erros."""
+    """
+    Versão final otimizada com:
+    - Cache em memória
+    - Geração paralela
+    - Fallback automático
+    - Monitoramento de recursos
+    """
     if not rate_limit(update, "aposta"):
         return
 
-    success_flag = False
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     progress_msg, progress_job = None, None
 
     try:
-        chat_id = update.effective_chat.id
-
-        if bot.dados is None or len(bot.dados) == 0:
-            safe_send_message(
-                context,
-                chat_id,
-                "❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados."
-            )
-            return
-
-        # Inicia barra de progresso
-        progress_msg, progress_job = _start_progress(context, chat_id)
-        context.bot_data['timeout'] = 30
-
-        # n de apostas
+        # 1. Configuração inicial
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
-        n_apostas = max(1, min(n_apostas, 10))
+        n_apostas = max(1, min(n_apostas, 10))  # Limite máximo de 10 apostas
 
-        # Geração com retry + fallback
+        # 2. Verificação de cache
+        cached = bot.get_cached_apostas(user_id, n_apostas)
+        if cached:
+            logger.info(f"Cache hit para {user_id} ({n_apostas} apostas)")
+            ResourceMonitor.log_resource_usage(context)
+            return enviar_apostas(context, chat_id, cached, "cache")
+
+        # 3. Barra de progresso
+        progress_msg, progress_job = _start_progress(context, chat_id)
+
+        # 4. Geração de apostas (com fallback)
         try:
-            apostas = bot.gerar_aposta_precisa_com_retry(
-                n_apostas=n_apostas,
-                seed=None,
-                retries=2
-            )
-            engine_label = "precisa"
-            logger.info(f"Geração precisa concluída para {n_apostas} apostas")
-        except Exception as e_precisa:
-            logger.warning(f"Falha no gerador preciso: {str(e_precisa)}")
+            with _DATA_LOCK:  # Protege acesso aos dados históricos
+                apostas = bot.gerar_apostas_paralelo(n_apostas)
+                engine_label = "paralelo"
+        except Exception as e:
+            logger.warning(f"Falha na geração paralela: {str(e)}")
             apostas = bot.gerar_aposta(n_apostas)
-            engine_label = "clássico"
-            logger.info(f"Usando fallback clássico para {n_apostas} apostas")
+            engine_label = "serial"
 
-        # Mensagem de resultado
-        mensagem = f"🎲 Apostas recomendadas — engine: {engine_label} 🎲\n\n"
-        for i, aposta in enumerate(apostas, 1):
-            if not isinstance(aposta, list) or len(aposta) != 15:
-                raise ValueError("Formato de aposta inválido")
-            pares = sum(1 for n in aposta if n % 2 == 0)
-            soma = sum(aposta)
-            mensagem += (
-                f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in sorted(aposta))}\n"
-                f"Pares: {pares} | Ímpares: {15-pares} | Soma: {soma}\n\n"
-            )
+        # 5. Pós-processamento
+        bot.set_cached_apostas(user_id, apostas)
+        ResourceMonitor.log_resource_usage(context)
 
-        safe_send_message(context, chat_id, mensagem)
-        logger.info(f"Apostas geradas: {n_apostas}")
-        success_flag = True
+        # 6. Envio dos resultados
+        enviar_apostas(context, chat_id, apostas, engine_label)
 
     except Exception as e:
-        logger.error(f"Erro no comando_aposta: {str(e)}", exc_info=True)
-        try:
-            safe_send_message(
-                context,
-                update.effective_chat.id,
-                "⚠️ Falha durante a geração. Por favor, tente novamente mais tarde."
-            )
-        except Exception:
-            pass
+        logger.error(f"Erro fatal em comando_aposta: {str(e)}", exc_info=True)
+        safe_send_message(context, chat_id, "⚠️ Falha crítica. Contate o administrador.")
+        
     finally:
-        # Fecha barra de progresso de forma segura
+        # 7. Limpeza final
         if progress_job:
-            try:
+            with contextlib.suppress(Exception):
                 progress_job.schedule_removal()
-            except Exception:
-                pass
         if progress_msg:
-            final_text = "✅ <b>Geração concluída.</b>" if success_flag else "❌ <b>Falha na geração.</b>"
-            _stop_progress(progress_job, progress_msg, final_text)
+            _stop_progress(progress_job, progress_msg, "✅ Finalizado")
+
+def enviar_apostas(context: CallbackContext, chat_id: int, apostas: List[List[int]], fonte: str) -> None:
+    """Função auxiliar para envio padronizado"""
+    mensagem = f"🎲 Apostas ({fonte}) 🎲\n\n"
+    for i, aposta in enumerate(apostas, 1):
+        pares = sum(1 for n in aposta if n % 2 == 0)
+        mensagem += (
+            f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
+            f"Pares: {pares} | Ímpares: {15-pares}\n\n"
+        )
+    safe_send_message(context, chat_id, mensagem)
             
 @somente_autorizado
 def comando_tendencia(update: Update, context: CallbackContext) -> None:
@@ -2526,6 +2582,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
