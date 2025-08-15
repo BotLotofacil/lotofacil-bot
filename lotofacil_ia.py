@@ -862,7 +862,7 @@ class BotLotofacil:
                 os.replace(checkpoint_tmp, self.modelo_path)
             else:
                 # fallback: salva direto no final (formato Keras moderno)
-            model.save(self.modelo_path)
+                model.save(self.modelo_path)
         except Exception as e:
             logger.warning(f"Falha ao gravar modelo final: {e}")
 
@@ -2537,6 +2537,7 @@ if __name__ == '__main__':
         main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
 
 
 
