@@ -800,15 +800,14 @@ class BotLotofacil:
         return clusters
 
     def construir_modelo(self) -> Optional[tf.keras.Model]:
+        # Tenta carregar modelo existente
         if os.path.exists(self.modelo_path):
             try:
                 return tf.keras.models.load_model(self.modelo_path)
             except Exception as e:
                 logger.warning(f"Modelo corrompido/incompatível. Recriando... Erro: {e}")
-                try:
+                with contextlib.suppress(Exception):
                     os.remove(self.modelo_path)
-                except Exception:
-                    pass
 
         X, y = self.preparar_dados_treinamento()
 
@@ -830,23 +829,43 @@ class BotLotofacil:
         )
 
         early = tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
-        checkpoint = tf.keras.callbacks.ModelCheckpoint(filepath=self.modelo_path, save_best_only=True)
+
+        # Salva o melhor em arquivo temporário e faz replace atômico no final
+        checkpoint_tmp = f"{self.modelo_path}.tmp.keras"
+        checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_tmp,
+            save_best_only=True,
+            save_weights_only=False
+        )
 
         n = len(X)
         if n < 10:
-            model.fit(X, y, epochs=50, batch_size=32, callbacks=[early, checkpoint], shuffle=False, verbose=0)
+            model.fit(
+                X, y, epochs=50, batch_size=32,
+                callbacks=[early, checkpoint_cb],
+                shuffle=False, verbose=0
+            )
         else:
             cut = int(n * 0.8)
             X_train, y_train = X[:cut], y[:cut]
             X_val, y_val = X[cut:], y[cut:]
-            model.fit(X_train, y_train, epochs=50, batch_size=32,
-                      validation_data=(X_val, y_val), callbacks=[early, checkpoint],
-                      shuffle=False, verbose=0)
+            model.fit(
+                X_train, y_train, epochs=50, batch_size=32,
+                validation_data=(X_val, y_val),
+                callbacks=[early, checkpoint_cb],
+                shuffle=False, verbose=0
+            )
 
+        # Se o temporário existe, faz replace atômico para o caminho final
         try:
+            if os.path.exists(checkpoint_tmp):
+                os.replace(checkpoint_tmp, self.modelo_path)
+            else:
+                # fallback: salva direto no final (formato Keras moderno)
             model.save(self.modelo_path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Falha ao gravar modelo final: {e}")
+
         return model
 
     def verificar_integridade_dados(self):
@@ -1867,8 +1886,9 @@ class BotLotofacil:
 # Bloco 4 — Telegram (handlers)
 # =========================
 
-# Instância principal do bot
-bot = BotLotofacil()
+# Instância principal do bot (inicializada no main)
+bot = None  # será atribuído em main()
+
 
 def apenas_admin(func):
     async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
@@ -1916,8 +1936,10 @@ async def comando_aposta(update: Update, context: CallbackContext) -> None:
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-
-    if not context.bot.is_ready(timeout=5):
+    
+    global bot
+    # Checagem instantânea, sem bloquear o loop
+    if not bot or not bot.is_ready(timeout=5):
         await update.message.reply_text("⚠️ O bot ainda está inicializando. Por favor, aguarde...")
         return
 
@@ -2435,9 +2457,7 @@ def main() -> None:
     try:
         os.makedirs("backups", exist_ok=True)
         os.makedirs("cache", exist_ok=True)
-
-        arquivos_necessarios = ['lotofacil_historico.csv', 'whitelist.txt']
-        for arquivo in arquivos_necessarios:
+        for arquivo in ['lotofacil_historico.csv', 'whitelist.txt']:
             if os.path.exists(arquivo):
                 if not verificar_e_corrigir_permissoes_arquivo(arquivo):
                     logger.error(f"Não foi possível corrigir permissões de {arquivo}")
@@ -2445,7 +2465,6 @@ def main() -> None:
                 logger.warning(f"Arquivo {arquivo} não encontrado - criando vazio")
                 open(arquivo, 'a').close()
                 verificar_e_corrigir_permissoes_arquivo(arquivo)
-
     except Exception as e:
         logger.critical(f"Falha na configuração inicial: {str(e)}")
         sys.exit(1)
@@ -2453,31 +2472,30 @@ def main() -> None:
     # 2. CONSTRUÇÃO DA APLICAÇÃO
     TOKEN = _get_bot_token()
     if not TOKEN:
-        # Mostra CHAVES semelhantes presentes para depuração, sem expor valores
         env_keys = [k for k in os.environ.keys() if "TOKEN" in k or "TELEGRAM" in k]
         logger.critical(
             "Token do Telegram não encontrado nas variáveis de ambiente. "
-            "Procure configurar TELEGRAM_BOT_TOKEN (ou BOT_TOKEN/TOKEN). "
-            f"Chaves relacionadas detectadas no ambiente: {env_keys}"
+            "Defina TELEGRAM_BOT_TOKEN (ou BOT_TOKEN/TOKEN). "
+            f"Chaves relacionadas detectadas: {env_keys}"
         )
         sys.exit(1)
 
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # 3. INICIALIZAÇÃO DO BOT (global)
+    # 3. INICIALIZAÇÃO DO CORE (única)
     global bot
     bot = BotLotofacil()
 
-    # Aguarda a inicialização (bloqueante, sem event loop)
+    # Aguarda até 240s; se atrasar, continua vivo (modo degraded)
     try:
-        ready = bot.is_ready(timeout=240)  # timeout em segundos
+        ready = bot.is_ready(timeout=240)
     except Exception as e:
-        logger.critical(f"Falha ao aguardar inicialização do bot: {e}")
-        sys.exit(1)
+        logger.error(f"Falha ao aguardar inicialização do core: {e}")
+        ready = False
 
     if not ready:
-        logger.critical("Timeout: Bot não ficou pronto em 4 minutos ou falhou na inicialização.")
-        sys.exit(1)
+        logger.warning("Inicialização não concluída em 4 minutos; seguindo em modo degradado. "
+                       "Comandos responderão 'inicializando' até concluir.")
 
     # 4. MONITORAMENTO DE RECURSOS
     try:
@@ -2500,10 +2518,9 @@ def main() -> None:
         CommandHandler("autorizar", comando_autorizar),
         CommandHandler("remover", comando_remover),
     ])
-
     application.add_error_handler(error_handler)
 
-    # 6. CONFIGURAÇÕES FINAIS DO BOT
+    # 6. CONFIGURAÇÕES FINAIS
     if not hasattr(bot, 'ultima_geracao_precisa'):
         bot.ultima_geracao_precisa = []
     if not hasattr(bot, 'engine_precisa_ativa'):
@@ -2511,19 +2528,17 @@ def main() -> None:
         bot.engine_precisa_falhas = 0
         bot.engine_precisa_erro = "Atributo não inicializado"
 
-    logger.info("✅ Bot inicializado com sucesso (PTB 22.x)")
-
-    # 7. EXECUÇÃO (sincrona; PTB gerencia o event loop internamente)
-    application.run_polling(
-        poll_interval=1.0,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    logger.info("✅ Bot inicializado (PTB 22.x). Iniciando polling.")
+    # 7. EXECUÇÃO
+    application.run_polling(poll_interval=1.0, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     try:
         main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
+
 
 
 
