@@ -2428,8 +2428,8 @@ async def safe_send_message(
             raise
 
 
-async def main() -> None:
-    """Função principal do bot com inicialização assíncrona e monitoramento seguro."""
+def main() -> None:
+    """Função principal do bot com inicialização e monitoramento seguro (PTB 22.x)."""
 
     # 1. CONFIGURAÇÃO INICIAL
     try:
@@ -2468,9 +2468,9 @@ async def main() -> None:
     global bot
     bot = BotLotofacil()
 
-    # Aguarda a inicialização em thread sem bloquear o event loop
+    # Aguarda a inicialização (bloqueante, sem event loop)
     try:
-        ready = await asyncio.to_thread(bot.is_ready, 240)  # timeout em segundos
+        ready = bot.is_ready(timeout=240)  # timeout em segundos
     except Exception as e:
         logger.critical(f"Falha ao aguardar inicialização do bot: {e}")
         sys.exit(1)
@@ -2511,19 +2511,21 @@ async def main() -> None:
         bot.engine_precisa_falhas = 0
         bot.engine_precisa_erro = "Atributo não inicializado"
 
-    logger.info("✅ Bot inicializado com sucesso no modo assíncrono (PTB v20+)")
+    logger.info("✅ Bot inicializado com sucesso (PTB 22.x)")
 
-    # 7. EXECUÇÃO
-    await application.run_polling(
+    # 7. EXECUÇÃO (sincrona; PTB gerencia o event loop internamente)
+    application.run_polling(
         poll_interval=1.0,
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
     )
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
+
 
 
 
