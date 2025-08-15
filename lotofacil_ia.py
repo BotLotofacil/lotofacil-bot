@@ -43,6 +43,27 @@ os.environ['OMP_NUM_THREADS'] = '1'
 # ThreadPool global para operações paralelas
 _GLOBAL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="aposta_")
 
+def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwargs) -> None:
+    """Envio seguro de mensagens com tratamento de timeout"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=kwargs.get('parse_mode', 'HTML'),
+                timeout=10 * (attempt + 1)
+            )
+            return
+        except telegram.error.TimedOut:
+            if attempt == max_retries - 1:
+                logger.error(f"Falha ao enviar mensagem após {max_retries} tentativas")
+                raise
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Erro ao enviar mensagem: {str(e)}")
+            raise
+
 # ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
 logging.basicConfig(
@@ -93,21 +114,31 @@ REQUEST_KWARGS = {
 _PROGRESS_FRAMES = ["▁","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃"]
 
 def _progress_tick(context):
+    """Versão segura com verificação de estado"""
+    if not hasattr(context.job, 'bot'):
+        return
+        
+    bot = context.job.bot
+    if getattr(bot, '_initializing', False) or not getattr(bot, '_ready', False):
+        context.job.schedule_removal()
+        return
+        
     data = context.job.context
     msg = data.get("msg")
     i = data.get("i", 0)
     t0 = data.get("t0", _now())
     frame = _PROGRESS_FRAMES[i % len(_PROGRESS_FRAMES)]
-    elapsed = int(_now() - t0)
+    
     try:
         bar = frame * 20
         msg.edit_text(
-            f"⏳ <b>Gerando apostas...</b>\n{bar}\n<i>{elapsed}s</i>",
+            f"⏳ <b>Gerando apostas...</b>\n{bar}\n<i>{int(_now() - t0)}s</i>",
             parse_mode='HTML'
         )
-    except Exception:
-        pass
-    data["i"] = i + 1
+    except Exception as e:
+        logger.debug(f"Erro ao atualizar progresso: {str(e)}")
+    finally:
+        data["i"] = i + 1
 
 def _start_progress(context, chat_id):
     """Cria a mensagem e agenda atualizações periódicas."""
@@ -444,45 +475,85 @@ class DataFetcher:
 
 class BotLotofacil:
     def __init__(self):
-        self.security = SecurityManager()
-        self.cache_dir = "cache"
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.modelo_path = 'modelo_lotofacil_avancado.keras'
-        self.dados = self.carregar_dados()
-        if self.dados is not None:
-            self.analisar_dados()
-            self.modelo = self.construir_modelo()
-        else:
-            logger.error("Falha ao carregar dados. Verifique sua conexão com a internet.")
-
-        # Núcleo preciso
-        self.cfg_precisa = ApostaConfig()
-        self.ultima_geracao_precisa: List[List[int]] = []
-
-        # Saúde/observabilidade do engine preciso
-        self.precise_enabled: bool = True
-        self.precise_fail_count: int = 0
-        self.precise_last_error: Optional[str] = None
-
-        # Sistema de cache em memória OTIMIZADO (NOVO)
-        from cachetools import TTLCache
-        self._aposta_cache = TTLCache(maxsize=1000, ttl=15)  # TTL reduzido para 15s
-        
-        # Pool de workers dedicado (NOVO)
-        from concurrent.futures import ThreadPoolExecutor
-        self._local_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="local_")
-        
-        # Autoteste simples no startup
+        self._initialized = threading.Event()
+        self._initialization_failed = False
+        self._initializing = True
+        self._ready = False
+    
+        # Configura timeout generoso para inicialização
+        signal.alarm(300)  # 5 minutos
+    
         try:
-            _ = self._teste_engine_precisa_startup()
+            # Configurações básicas
+            self.security = SecurityManager()
+            self.cache_dir = "cache"
+            os.makedirs(self.cache_dir, exist_ok=True)
+            self.modelo_path = 'modelo_lotofacil_avancado.keras'
+        
+            # Inicialização assíncrona
+            self._init_thread = threading.Thread(
+                target=self._initialize_async,
+                daemon=True,
+                name="BotInitialization"
+            )
+            self._init_thread.start()
+        
+            # Pool de workers dedicado
+            self._local_executor = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="local_"
+            )
+        
+            # Sistema de cache em memória
+            from cachetools import TTLCache
+            self._aposta_cache = TTLCache(maxsize=1000, ttl=15)
+        
+        except Exception as e:
+            self._initialization_failed = True
+            logger.critical(f"Falha crítica na inicialização: {str(e)}")
+            raise
+        finally:
+            signal.alarm(0)
+
+    def _initialize_async(self):
+        """Executa a inicialização em thread separada"""
+        try:
+            # Carrega dados
+            self.dados = self.carregar_dados()
+            if self.dados is None:
+                raise RuntimeError("Falha ao carregar dados históricos")
+            
+            # Processamento dos dados
+            self.analisar_dados()
+        
+            # Construção do modelo
+            self.modelo = self.construir_modelo()
+        
+            # Núcleo preciso
+            self.cfg_precisa = ApostaConfig()
+            self.ultima_geracao_precisa = []
             self.precise_enabled = True
             self.precise_fail_count = 0
             self.precise_last_error = None
-            logger.info("Engine precisa OK no startup.")
+        
+            # Autoteste
+            self._teste_engine_precisa_startup()
+        
+            logger.info("Inicialização assíncrona concluída com sucesso")
+            self._ready = True
+        
         except Exception as e:
-            self.precise_enabled = False
-            self.precise_last_error = str(e)
-            logger.warning(f"Engine precisa desativado no startup: {e}")
+            self._initialization_failed = True
+            logger.critical(f"Falha na inicialização assíncrona: {str(e)}")
+        finally:
+            self._initialized.set()
+            self._initializing = False
+
+    def is_ready(self, timeout=None):
+        """Verifica se a inicialização foi concluída"""
+        if self._initialized.wait(timeout=timeout):
+            return not self._initialization_failed
+        return False
 
     def get_cached_apostas(self, user_id: int, n_apostas: int) -> Optional[List[List[int]]]:
         """Obtém apostas do cache com lock mínimo usando TTLCache"""
@@ -1913,15 +1984,16 @@ def start(update: Update, context: CallbackContext) -> None:
 
 @somente_autorizado
 def comando_aposta(update: Update, context: CallbackContext) -> None:
-    """
-    Versão síncrona corrigida
-    """
     if not rate_limit(update, "aposta"):
         return
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    progress_msg, progress_job = None, None
+    
+    # Verifica se o bot está pronto
+    if not bot.is_ready(timeout=5):
+        update.message.reply_text("⚠️ O bot ainda está inicializando. Por favor, aguarde...")
+        return
 
     try:
         # Configura timeout
@@ -1940,7 +2012,7 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
         # 3. Barra de progresso
         progress_msg, progress_job = _start_progress(context, chat_id)
 
-        # 4. Geração de apostas (síncrona)
+        # 4. Geração de apostas
         apostas = bot.gerar_apostas_paralelo(n_apostas)
         engine_label = "paralelo"
 
@@ -2431,7 +2503,7 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
             raise
 
 def main() -> None:
-    """Função principal do bot com monitoramento de recursos completo."""
+    """Função principal do bot com monitoramento de recursos completo e inicialização segura."""
     # Configuração inicial segura
     try:
         os.makedirs("backups", exist_ok=True)
@@ -2452,8 +2524,19 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        signal.alarm(120)  # Timeout de 2 minutos
+        # Configura timeout generoso para inicialização (5 minutos)
+        signal.alarm(300)
 
+        # Inicializa o bot de forma assíncrona
+        global bot
+        bot = BotLotofacil()
+
+        # Aguarda inicialização completa com timeout de 4 minutos
+        if not bot.is_ready(timeout=240):
+            logger.critical("Timeout na inicialização do bot (excedeu 4 minutos)")
+            sys.exit(1)
+
+        # Configura o updater do Telegram
         updater = None
         try:
             updater = Updater(
@@ -2467,6 +2550,7 @@ def main() -> None:
             logger.critical(f"Falha na inicialização do Updater: {str(e)}")
             raise
 
+        # Configuração do monitoramento de recursos
         jq = updater.job_queue if updater else None
         if jq:
             try:
@@ -2485,6 +2569,7 @@ def main() -> None:
         else:
             logger.warning("JobQueue indisponível - monitoramento de recursos desativado")
 
+        # Verificação inicial de saúde do sistema
         try:
             stats = ResourceMonitor.get_system_stats()
             if stats:
@@ -2499,6 +2584,7 @@ def main() -> None:
         except Exception as e:
             logger.error(f"Falha no teste inicial do monitoramento: {str(e)}")
 
+        # Registro dos handlers de comandos
         handlers = [
             CommandHandler("start", start),
             CommandHandler("meuid", comando_meuid),
@@ -2519,20 +2605,26 @@ def main() -> None:
 
         dp.add_error_handler(error_handler)
 
-        # ⬇️ Inicialização da IA e da engine precisa
-        bot.ultima_execucao = None
-        bot.engine_precisa_ativa = True
-        bot.engine_precisa_falhas = 0
-        bot.engine_precisa_erro = None
-        bot.ultima_geracao_precisa = []
+        # Verificação final do estado do bot
+        if not hasattr(bot, 'ultima_geracao_precisa'):
+            bot.ultima_geracao_precisa = []
+        if not hasattr(bot, 'engine_precisa_ativa'):
+            bot.engine_precisa_ativa = False
+            bot.engine_precisa_falhas = 0
+            bot.engine_precisa_erro = "Atributo não inicializado"
 
-        if hasattr(bot, "carregar_dados"):
-            bot.carregar_dados()
+        logger.info(
+            f"✅ Bot inicializado com sucesso\n"
+            f"• Engine precisa: {'ATIVA' if bot.engine_precisa_ativa else 'INATIVA'}\n"
+            f"• Monitoramento: {'ATIVO' if jq else 'INATIVO'}\n"
+            f"• Workers: {updater.dispatcher.workers}\n"
+            f"• Timeouts: {REQUEST_KWARGS['connect_timeout']}s connect, {REQUEST_KWARGS['read_timeout']}s read"
+        )
 
-        if hasattr(bot, "_teste_engine_precisa_startup"):
-            bot._teste_engine_precisa_startup()
+        # Desativa o alarme após inicialização bem-sucedida
+        signal.alarm(0)
 
-        logger.info("Iniciando bot com verificações de recursos...")
+        # Inicia o polling
         try:
             updater.start_polling(
                 poll_interval=0.5,
@@ -2540,20 +2632,10 @@ def main() -> None:
                 drop_pending_updates=True,
                 bootstrap_retries=3
             )
+            updater.idle()
         except Exception as e:
             logger.critical(f"Falha no start_polling: {str(e)}")
             raise
-
-        logger.info(
-            f"✅ Bot em operação normal\n"
-            f"• Monitoramento: {'ATIVO' if jq else 'INATIVO'}\n"
-            f"• Checks de memória: >{_MAX_MEMORY_ALERT}% (alerta)\n"
-            f"• Workers: {updater.dispatcher.workers}\n"
-            f"• Timeouts: {REQUEST_KWARGS['connect_timeout']}s connect, {REQUEST_KWARGS['read_timeout']}s read"
-        )
-
-        signal.alarm(0)
-        updater.idle()
 
     except telegram.error.NetworkError as e:
         logger.critical(f"ERRO DE REDE: {str(e)}")
@@ -2565,7 +2647,7 @@ def main() -> None:
         logger.critical(f"ERRO DO TELEGRAM: {str(e)}")
         sys.exit(1)
     except TimeoutError:
-        logger.critical("Timeout na inicialização do bot (excedeu 2 minutos)")
+        logger.critical("Timeout na inicialização do bot (excedeu o tempo limite)")
         sys.exit(1)
     except Exception as e:
         logger.critical(
