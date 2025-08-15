@@ -30,11 +30,18 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     logging.warning("psutil não instalado - monitoramento desativado")
 
-# ---- Locks específicos (NOVO BLOCO ADICIONADO) ----
+# ---- Locks específicos otimizados ----
 _MODEL_LOCK = Lock()    # Para operações com o modelo LSTM
 _DATA_LOCK = Lock()     # Para acesso aos dados históricos
-_CACHE_LOCK = Lock()    # Para operações de cache
-_RESOURCE_LOCK = Lock() # Mantido para compatibilidade (será removido gradualmente)
+_CACHE_LOCK = Lock()    # Para operações de cache (TTL reduzido)
+
+# Configuração thread-safe do TensorFlow
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '4'
+os.environ['OMP_NUM_THREADS'] = '1'
+
+# ThreadPool global para operações paralelas
+_GLOBAL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="aposta_")
 
 # ---- Logging precisa estar definido antes de qualquer uso de logger ----
 warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
@@ -188,14 +195,6 @@ def backup_csv() -> Optional[str]:
     except Exception as e:
         logger.error(f"Falha no backup principal: {str(e)}", exc_info=True)
         return None
-
-# Configuração inicial de warnings e logging
-warnings.filterwarnings("ignore", message="oneDNN custom operations are on")
-logging.basicConfig(
-    format='{"time": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
     
 # Token do Telegram via variável de ambiente (Railway/Render/etc.)
 TOKEN = os.getenv("TOKEN", "").strip()
@@ -465,10 +464,13 @@ class BotLotofacil:
         self.precise_fail_count: int = 0
         self.precise_last_error: Optional[str] = None
 
-        # Sistema de cache em memória
-        self._aposta_cache = {}      # Dicionário para armazenar apostas
-        self._cache_expiry = {}      # Tempo de expiração do cache
-        # self._cache_lock já definido globalmente
+        # Sistema de cache em memória OTIMIZADO (NOVO)
+        from cachetools import TTLCache
+        self._aposta_cache = TTLCache(maxsize=1000, ttl=15)  # TTL reduzido para 15s
+        
+        # Pool de workers dedicado (NOVO)
+        from concurrent.futures import ThreadPoolExecutor
+        self._local_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="local_")
         
         # Autoteste simples no startup
         try:
@@ -483,47 +485,63 @@ class BotLotofacil:
             logger.warning(f"Engine precisa desativado no startup: {e}")
 
     def get_cached_apostas(self, user_id: int, n_apostas: int) -> Optional[List[List[int]]]:
-        """Obtém apostas do cache se disponíveis e válidas"""
+        """Obtém apostas do cache com lock mínimo usando TTLCache"""
         with _CACHE_LOCK:
             cached = self._aposta_cache.get(user_id)
-            expiry = self._cache_expiry.get(user_id, 0)
-            
-            if cached and time.time() < expiry:
+            if cached:
                 logger.debug(f"Cache HIT para usuário {user_id}")
                 return cached[:n_apostas]
             logger.debug(f"Cache MISS para usuário {user_id}")
             return None
 
-    def set_cached_apostas(self, user_id: int, apostas: List[List[int]], ttl: int = 30) -> None:
-        """Armazena apostas no cache com tempo de vida (TTL) em segundos"""
+    def set_cached_apostas(self, user_id: int, apostas: List[List[int]], ttl: int = 15) -> None:
+        """Armazena apostas no cache TTLCache com lock mínimo"""
         with _CACHE_LOCK:
             self._aposta_cache[user_id] = apostas
-            self._cache_expiry[user_id] = time.time() + ttl
-            logger.debug(f"Cache SET para usuário {user_id} (TTL: {ttl}s)") 
+            logger.debug(f"Cache SET para usuário {user_id} (TTL: {ttl}s)")
 
-    def gerar_apostas_paralelo(self, n_apostas: int = 5, n_workers: int = 4) -> List[List[int]]:
+    async def gerar_apostas_paralelo(self, n_apostas: int = 5) -> List[List[int]]:
         """
-        Gera apostas em paralelo usando ThreadPoolExecutor.
-        
+        Versão otimizada com executor global e fallback hierárquico
+    
         Args:
             n_apostas: Quantidade de apostas a gerar
-            n_workers: Número de threads paralelas (recomendado 2-4)
-            
+        
         Returns:
             Lista de apostas geradas
         """
         if not hasattr(self, 'gerar_aposta_precisa_com_retry'):
             logger.error("Método gerar_aposta_precisa_com_retry não disponível")
-            return self.gerar_aposta(n_apostas)  # Fallback seguro
+            return await self._fallback_serial(n_apostas)
 
         try:
-            with ThreadPoolExecutor(max_workers=min(n_workers, 4)) as executor:
-                futures = [executor.submit(self.gerar_aposta_precisa_com_retry, 1) for _ in range(n_apostas)]
-                return [f.result()[0] for f in futures]
-                
+            # Tenta primeiro com o executor global
+            futures = [_GLOBAL_EXECUTOR.submit(self.gerar_aposta_precisa_com_retry, 1) 
+                      for _ in range(n_apostas)]
+            return [f.result()[0] for f in futures]
+            
         except Exception as e:
-            logger.error(f"Falha na geração paralela: {str(e)}")
-            return self.gerar_aposta(n_apostas)  # Fallback para versão serial
+            logger.warning(f"Falha no executor global: {str(e)}")
+            try:
+                # Fallback para executor local
+                futures = [self._local_executor.submit(self.gerar_aposta_precisa_com_retry, 1)
+                          for _ in range(n_apostas)]
+                return [f.result()[0] for f in futures]
+            except Exception as e:
+                logger.error(f"Falha no executor local: {str(e)}")
+                return await self._fallback_serial(n_apostas)
+
+    async def _fallback_serial(self, n_apostas: int) -> List[List[int]]:
+        """Fallback serial para quando o paralelismo falha"""
+        logger.warning("Usando fallback serial para geração de apostas")
+        try:
+            apostas = []
+            for _ in range(n_apostas):
+                apostas.append(self.gerar_aposta_precisa_com_retry(1)[0])
+            return apostas
+        except Exception as e:
+            logger.critical(f"Falha crítica no fallback serial: {str(e)}")
+            raise RuntimeError("Não foi possível gerar apostas")
      
     # -------------------------
     # Dados / preparação
@@ -1884,11 +1902,10 @@ def start(update: Update, context: CallbackContext) -> None:
 @somente_autorizado
 def comando_aposta(update: Update, context: CallbackContext) -> None:
     """
-    Versão final otimizada com:
-    - Cache em memória
-    - Geração paralela
-    - Fallback automático
-    - Monitoramento de recursos
+    Versão otimizada com:
+    - Operações assíncronas
+    - Timeout explícito
+    - Fallback hierárquico
     """
     if not rate_limit(update, "aposta"):
         return
@@ -1898,43 +1915,52 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
     progress_msg, progress_job = None, None
 
     try:
+        # Configura timeout
+        signal.alarm(15)  # 15 segundos para operação completa
+        
         # 1. Configuração inicial
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
-        n_apostas = max(1, min(n_apostas, 10))  # Limite máximo de 10 apostas
+        n_apostas = max(1, min(n_apostas, 10))
 
-        # 2. Verificação de cache
+        # 2. Verificação de cache (rápida)
         cached = bot.get_cached_apostas(user_id, n_apostas)
         if cached:
             logger.info(f"Cache hit para {user_id} ({n_apostas} apostas)")
-            ResourceMonitor.log_resource_usage(context)
             return enviar_apostas(context, chat_id, cached, "cache")
 
         # 3. Barra de progresso
         progress_msg, progress_job = _start_progress(context, chat_id)
 
-        # 4. Geração de apostas (com fallback)
+        # 4. Hierarquia de fallback
         try:
-            with _DATA_LOCK:  # Protege acesso aos dados históricos
-                apostas = bot.gerar_apostas_paralelo(n_apostas)
-                engine_label = "paralelo"
+            # Tenta versão paralela primeiro
+            apostas = bot.gerar_apostas_paralelo(n_apostas)
+            engine_label = "paralelo"
         except Exception as e:
             logger.warning(f"Falha na geração paralela: {str(e)}")
-            apostas = bot.gerar_aposta(n_apostas)
-            engine_label = "serial"
+            try:
+                # Fallback para versão serial com timeout
+                apostas = bot.gerar_aposta(n_apostas)
+                engine_label = "serial"
+            except Exception as e:
+                logger.error(f"Falha crítica na geração: {str(e)}")
+                raise
 
-        # 5. Pós-processamento
+        # 5. Cache e envio
         bot.set_cached_apostas(user_id, apostas)
-        ResourceMonitor.log_resource_usage(context)
-
-        # 6. Envio dos resultados
         enviar_apostas(context, chat_id, apostas, engine_label)
 
+    except TimeoutError:
+        logger.warning(f"Timeout gerando apostas para {user_id}")
+        safe_send_message(context, chat_id, "⏱️ Operação excedeu o tempo limite. Tente novamente.")
+        
     except Exception as e:
-        logger.error(f"Erro fatal em comando_aposta: {str(e)}", exc_info=True)
+        logger.error(f"Erro em comando_aposta: {str(e)}", exc_info=True)
         safe_send_message(context, chat_id, "⚠️ Falha crítica. Contate o administrador.")
         
     finally:
-        # 7. Limpeza final
+        # Limpeza garantida
+        signal.alarm(0)
         if progress_job:
             with contextlib.suppress(Exception):
                 progress_job.schedule_removal()
@@ -2582,6 +2608,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
