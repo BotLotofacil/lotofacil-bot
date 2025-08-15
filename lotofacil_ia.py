@@ -23,6 +23,9 @@ import logging
 import warnings
 from typing import Optional, Dict, List, Tuple, Set
 from threading import Lock
+from dotenv import load_dotenv
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Configuração segura do psutil
 try:
@@ -2486,6 +2489,7 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
 
 
 
