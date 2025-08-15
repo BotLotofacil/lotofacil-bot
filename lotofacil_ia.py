@@ -500,9 +500,9 @@ class BotLotofacil:
             self._aposta_cache[user_id] = apostas
             logger.debug(f"Cache SET para usuário {user_id} (TTL: {ttl}s)")
 
-    async def gerar_apostas_paralelo(self, n_apostas: int = 5) -> List[List[int]]:
+    def gerar_apostas_paralelo(self, n_apostas: int = 5) -> List[List[int]]:
         """
-        Versão otimizada com executor global e fallback hierárquico
+        Versão síncrona com executor global e fallback hierárquico
     
         Args:
             n_apostas: Quantidade de apostas a gerar
@@ -512,7 +512,7 @@ class BotLotofacil:
         """
         if not hasattr(self, 'gerar_aposta_precisa_com_retry'):
             logger.error("Método gerar_aposta_precisa_com_retry não disponível")
-            return await self._fallback_serial(n_apostas)
+            return self._fallback_serial(n_apostas)
 
         try:
             # Tenta primeiro com o executor global
@@ -529,7 +529,19 @@ class BotLotofacil:
                 return [f.result()[0] for f in futures]
             except Exception as e:
                 logger.error(f"Falha no executor local: {str(e)}")
-                return await self._fallback_serial(n_apostas)
+                return self._fallback_serial(n_apostas)
+
+    def _fallback_serial(self, n_apostas: int) -> List[List[int]]:
+        """Fallback serial para quando o paralelismo falha"""
+        logger.warning("Usando fallback serial para geração de apostas")
+        try:
+            apostas = []
+            for _ in range(n_apostas):
+                apostas.append(self.gerar_aposta_precisa_com_retry(1)[0])
+            return apostas
+        except Exception as e:
+            logger.critical(f"Falha crítica no fallback serial: {str(e)}")
+            raise RuntimeError("Não foi possível gerar apostas")
 
     async def _fallback_serial(self, n_apostas: int) -> List[List[int]]:
         """Fallback serial para quando o paralelismo falha"""
@@ -1902,10 +1914,7 @@ def start(update: Update, context: CallbackContext) -> None:
 @somente_autorizado
 def comando_aposta(update: Update, context: CallbackContext) -> None:
     """
-    Versão otimizada com:
-    - Operações assíncronas
-    - Timeout explícito
-    - Fallback hierárquico
+    Versão síncrona corrigida
     """
     if not rate_limit(update, "aposta"):
         return
@@ -1916,13 +1925,13 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
 
     try:
         # Configura timeout
-        signal.alarm(15)  # 15 segundos para operação completa
-        
+        signal.alarm(15)
+
         # 1. Configuração inicial
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
         n_apostas = max(1, min(n_apostas, 10))
 
-        # 2. Verificação de cache (rápida)
+        # 2. Verificação de cache
         cached = bot.get_cached_apostas(user_id, n_apostas)
         if cached:
             logger.info(f"Cache hit para {user_id} ({n_apostas} apostas)")
@@ -1931,20 +1940,9 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
         # 3. Barra de progresso
         progress_msg, progress_job = _start_progress(context, chat_id)
 
-        # 4. Hierarquia de fallback
-        try:
-            # Tenta versão paralela primeiro
-            apostas = bot.gerar_apostas_paralelo(n_apostas)
-            engine_label = "paralelo"
-        except Exception as e:
-            logger.warning(f"Falha na geração paralela: {str(e)}")
-            try:
-                # Fallback para versão serial com timeout
-                apostas = bot.gerar_aposta(n_apostas)
-                engine_label = "serial"
-            except Exception as e:
-                logger.error(f"Falha crítica na geração: {str(e)}")
-                raise
+        # 4. Geração de apostas (síncrona)
+        apostas = bot.gerar_apostas_paralelo(n_apostas)
+        engine_label = "paralelo"
 
         # 5. Cache e envio
         bot.set_cached_apostas(user_id, apostas)
@@ -1959,14 +1957,13 @@ def comando_aposta(update: Update, context: CallbackContext) -> None:
         safe_send_message(context, chat_id, "⚠️ Falha crítica. Contate o administrador.")
         
     finally:
-        # Limpeza garantida
         signal.alarm(0)
         if progress_job:
             with contextlib.suppress(Exception):
                 progress_job.schedule_removal()
         if progress_msg:
             _stop_progress(progress_job, progress_msg, "✅ Finalizado")
-
+            
 def enviar_apostas(context: CallbackContext, chat_id: int, apostas: List[List[int]], fonte: str) -> None:
     """Função auxiliar para envio padronizado"""
     mensagem = f"🎲 Apostas ({fonte}) 🎲\n\n"
@@ -2608,6 +2605,7 @@ if __name__ == "__main__":
     except SystemExit as e:
         logger.error(f"Bot encerrado com código {e.code}")
         raise
+
 
 
 
