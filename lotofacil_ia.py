@@ -54,20 +54,19 @@ logger = logging.getLogger(__name__)
 
 # Função utilitária segura de envio
 from telegram.error import TelegramError
-from telegram.ext import ContextTypes
+from telegram.ext import Context
 
 async def safe_send_message(
-    context: ContextTypes.DEFAULT_TYPE,
+    context: Context,
     chat_id: int,
     text: str,
     **kwargs
 ) -> None:
     """
     Envia uma mensagem com segurança para o chat especificado, tratando erros do Telegram.
-    Compatível com python-telegram-bot v20+ (async).
 
     Args:
-        context (ContextTypes.DEFAULT_TYPE): Contexto da atualização.
+        context (Context): Contexto da atualização.
         chat_id (int): ID do chat para onde a mensagem será enviada.
         text (str): Texto da mensagem.
         **kwargs: Parâmetros adicionais para context.bot.send_message.
@@ -127,7 +126,7 @@ REQUEST_KWARGS = {
 
 _PROGRESS_FRAMES = ["▁", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃"]
 
-async def _progress_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _progress_tick(update: Update, context: Context):
     """Versão assíncrona segura com verificação de estado"""
     job = context.job
     data = job.data
@@ -148,7 +147,7 @@ async def _progress_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         data["i"] = i + 1
 
-async def _start_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def _start_progress(context: Context, chat_id: int):
     """Cria a mensagem e agenda atualizações periódicas."""
     msg = await context.bot.send_message(chat_id, "⏳ Iniciando geração...", parse_mode='HTML')
     job = context.job_queue.run_repeating(
@@ -191,7 +190,7 @@ async def gerar_aposta_para_usuario(user_id: int) -> List[int]:
         return aposta
 
 # Handler assíncrono para o comando /aposta
-async def handler_aposta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handler_aposta(update: Update, context: Context) -> None:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -2740,6 +2739,7 @@ if __name__ == '__main__':
 
     # Execução do bot
     application.run_polling()
+
 
 
 
