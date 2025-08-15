@@ -32,9 +32,9 @@ except ImportError:
     logging.warning("psutil não instalado - monitoramento desativado")
 
 # ---- Locks específicos otimizados ----
-_MODEL_LOCK = Lock()    # Para operações com o modelo LSTM
-_DATA_LOCK = Lock()     # Para acesso aos dados históricos
-_CACHE_LOCK = Lock()    # Para operações de cache (TTL reduzido)
+_MODEL_LOCK = Lock()
+_DATA_LOCK = Lock()
+_CACHE_LOCK = Lock()
 
 # Configuração thread-safe do TensorFlow
 os.environ['TF_NUM_INTEROP_THREADS'] = '1'
@@ -54,23 +54,14 @@ logger = logging.getLogger(__name__)
 
 # Função utilitária segura de envio
 from telegram.error import TelegramError
-from telegram.ext import Context
+from telegram.ext import CallbackContext
 
 async def safe_send_message(
-    context: Context,
+    context: CallbackContext,
     chat_id: int,
     text: str,
     **kwargs
 ) -> None:
-    """
-    Envia uma mensagem com segurança para o chat especificado, tratando erros do Telegram.
-
-    Args:
-        context (Context): Contexto da atualização.
-        chat_id (int): ID do chat para onde a mensagem será enviada.
-        text (str): Texto da mensagem.
-        **kwargs: Parâmetros adicionais para context.bot.send_message.
-    """
     try:
         await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except TelegramError as e:
@@ -102,7 +93,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     filters,
-    ContextTypes,
+    CallbackContext,
+    JobQueue,
 )
 
 # Núcleo preciso (score + GRASP + diversidade)
@@ -117,101 +109,8 @@ import time
 REQUEST_KWARGS = {
     "connect_timeout": int(os.getenv("TELEGRAM_CONNECT_TIMEOUT", 10)),
     "read_timeout": int(os.getenv("TELEGRAM_READ_TIMEOUT", 20)),
-    # "con_pool_size" e "pool_timeout" não são utilizados no PTB v20+
 }
 
-# ============================
-# BLOCO 2 — LÓGICA DO COMANDO /APOSTA
-# ============================
-
-_PROGRESS_FRAMES = ["▁", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃"]
-
-async def _progress_tick(update: Update, context: Context):
-    """Versão assíncrona segura com verificação de estado"""
-    job = context.job
-    data = job.data
-
-    msg = data.get("msg")
-    i = data.get("i", 0)
-    t0 = data.get("t0", _now())
-    frame = _PROGRESS_FRAMES[i % len(_PROGRESS_FRAMES)]
-
-    try:
-        bar = frame * 20
-        await msg.edit_text(
-            f"⏳ <b>Gerando apostas...</b>\n{bar}\n<i>{int(_now() - t0)}s</i>",
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.debug(f"Erro ao atualizar progresso: {str(e)}")
-    finally:
-        data["i"] = i + 1
-
-async def _start_progress(context: Context, chat_id: int):
-    """Cria a mensagem e agenda atualizações periódicas."""
-    msg = await context.bot.send_message(chat_id, "⏳ Iniciando geração...", parse_mode='HTML')
-    job = context.job_queue.run_repeating(
-        _progress_tick,
-        interval=0.7,
-        first=0.0,
-        data={"msg": msg, "i": 0, "t0": _now()}
-    )
-    return msg, job
-
-async def _stop_progress(job, msg, final_text: str):
-    """Para as atualizações e finaliza a mensagem de progresso."""
-    try:
-        job.schedule_removal()
-    except Exception:
-        pass
-    try:
-        await msg.edit_text(final_text, parse_mode='HTML')
-    except Exception:
-        pass
-
-# Tratador de timeout de sistema Unix (opcional)
-def handler(signum, frame):
-    raise TimeoutError("Operação excedeu o tempo limite")
-signal.signal(signal.SIGALRM, handler)  # Configura o handler
-
-# ================================
-# CONTROLE ASSÍNCRONO POR USUÁRIO (SEM BLOQUEIO GLOBAL)
-# ================================
-
-# Substitui o uso de threading.Lock() global, que causava bloqueios em execuções simultâneas
-user_locks = defaultdict(asyncio.Lock)
-
-# Função assíncrona de geração de apostas (exemplo básico — substitua pela lógica real)
-async def gerar_aposta_para_usuario(user_id: int) -> List[int]:
-    async with user_locks[user_id]:
-        # Exemplo: Gera 15 dezenas aleatórias entre 1 e 25 (sem repetição)
-        aposta = random.sample(range(1, 26), 15)
-        aposta.sort()
-        return aposta
-
-# Handler assíncrono para o comando /aposta
-async def handler_aposta(update: Update, context: Context) -> None:
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    # Inicia barra de progresso (mensagem + job)
-    progress_msg, job = await _start_progress(context, chat_id)
-
-    try:
-        # Gera a aposta com bloqueio assíncrono por usuário
-        aposta = await gerar_aposta_para_usuario(user_id)
-
-        # Monta a resposta formatada
-        dezenas_str = " ".join(f"{dez:02d}" for dez in aposta)
-        texto_final = f"✅ <b>Sua aposta está pronta:</b>\n{dezenas_str}"
-
-        # Finaliza mensagem de progresso
-        await _stop_progress(job, progress_msg, texto_final)
-
-    except Exception as e:
-        logger.exception("Erro durante a geração de aposta")
-        await _stop_progress(job, progress_msg, "⚠️ Erro ao gerar sua aposta. Tente novamente.")
-    
 # ================================
 # Bloco 2 — Constantes & Bootstrap
 # ================================
@@ -244,85 +143,16 @@ MANUAL_USUARIO = (
 
 MSG_RATE_LIMIT = "⏳ Aguarde alguns segundos antes de usar novamente."
 
-def backup_csv() -> Optional[str]:
-    """Cria backup sincronizado do histórico em CSV"""
-    origem = "lotofacil_historico.csv"
-    if not os.path.exists(origem):
-        logger.error("Arquivo origem para backup não encontrado: %s", origem)
-        return None
-
-    os.makedirs("backups", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    destino = f"backups/lotofacil_historico_backup_{timestamp}.csv"
-    
-    try:
-        with open(origem, 'rb') as f_orig, open(destino, 'wb') as f_dest:
-            shutil.copyfileobj(f_orig, f_dest)
-            f_dest.flush()
-            os.fsync(f_dest.fileno())
-
-        if os.path.exists(destino):
-            logger.info(f"Backup criado com sucesso: {destino} ({os.path.getsize(destino)} bytes)")
-            return destino
-        else:
-            logger.error("Falha misteriosa - backup não criado após operação aparentemente bem-sucedida")
-            return None
-
-    except Exception as e:
-        logger.error(f"Falha no backup principal: {str(e)}", exc_info=True)
-        return None
-
-# Token do Telegram via variável de ambiente
-TOKEN = os.getenv("TOKEN", "").strip()
-if not TOKEN:
-    raise RuntimeError("TOKEN não definido no ambiente.")
-
-# Diretório base do script
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Diretório persistente do container (ex.: /data). Se existir, usamos como CWD.
-DATA_DIR = os.getenv("DATA_DIR")
-if DATA_DIR:
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    for _fn in ("lotofacil_historico.csv", "whitelist.txt", "modelo_lotofacil_avancado.keras"):
-        src = os.path.join(BASE_DIR, _fn)
-        dst = os.path.join(DATA_DIR, _fn)
-        if (not os.path.exists(dst)) and os.path.exists(src):
-            try:
-                shutil.copy2(src, dst)
-            except Exception as e:
-                logger.warning(f"Não foi possível copiar {src} -> {dst}: {e}")
-
-    # Remove modelo legado .h5
-    try:
-        old_h5 = os.path.join(DATA_DIR, "modelo_lotofacil_avancado.h5")
-        if os.path.exists(old_h5):
-            os.remove(old_h5)
-    except Exception:
-        pass
-
-    # Atualiza o diretório de trabalho
-    try:
-        os.chdir(DATA_DIR)
-    except Exception as e:
-        logger.warning(f"Falha ao trocar para DATA_DIR ({DATA_DIR}): {e}")
-
 # Admins e controle de recursos
 ADMIN_USER_IDS: Set[int] = {5344714174}  # ajuste conforme necessário
-
 _RESOURCE_LOCK = Lock()
-_MAX_MEMORY_ALERT = 85      # % uso de RAM
-_MIN_MEMORY_ALERT = 1024    # MB livres mínimos
+_MAX_MEMORY_ALERT = 85
+_MIN_MEMORY_ALERT = 1024
 
-# Rate limit (anti-spam por usuário/comando)
+# Controle de rate-limit
 _rate_limit_map: Dict[int, Dict[str, float]] = {}
 
 async def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
-    """
-    Anti-spam por usuário/comando (async).
-    Retorna False se deve bloquear a execução (muito cedo); True caso possa prosseguir.
-    """
     user_id = update.effective_user.id
     agora = _now()
     user_map = _rate_limit_map.setdefault(user_id, {})
@@ -339,24 +169,17 @@ async def rate_limit(update: Update, comando: str, segundos: int = 8) -> bool:
     return True
 
 def verificar_e_corrigir_permissoes_arquivo(caminho: str) -> bool:
-    """Verifica e corrige permissões do arquivo, retorna True se ok"""
     if not os.path.exists(caminho):
         logger.error(f"Arquivo {caminho} não encontrado para verificação de permissões")
         return False
-    
     try:
-        # Obtém modo atual
         modo_atual = os.stat(caminho).st_mode & 0o777
         logger.info(f"Permissões atuais de {caminho}: {oct(modo_atual)}")
-        
-        # Permissões ideais: dono/grupo podem ler+escrever, outros só leitura
         modo_ideal = 0o664
-        
         if modo_atual != modo_ideal:
             logger.warning(f"Corrigindo permissões de {caminho} de {oct(modo_atual)} para {oct(modo_ideal)}")
             try:
                 os.chmod(caminho, modo_ideal)
-                # Verifica se a mudança foi aplicada
                 novo_modo = os.stat(caminho).st_mode & 0o777
                 if novo_modo != modo_ideal:
                     logger.error(f"Falha ao alterar permissões de {caminho}. Novo modo: {oct(novo_modo)}")
@@ -369,6 +192,32 @@ def verificar_e_corrigir_permissoes_arquivo(caminho: str) -> bool:
     except Exception as e:
         logger.error(f"Falha ao verificar permissões de {caminho}: {str(e)}")
         return False
+
+class SecurityManager:
+    def __init__(self) -> None:
+        self.whitelist: Set[int] = set()
+        self.admins: Set[int] = set(ADMIN_USER_IDS)
+        self.load_whitelist()
+
+    def load_whitelist(self, file: str = "whitelist.txt") -> None:
+        try:
+            if os.path.exists(file):
+                with open(file, "r", encoding="utf-8") as f:
+                    self.whitelist = {
+                        int(line.strip())
+                        for line in f
+                        if line.strip().isdigit()
+                    }
+            else:
+                open(file, "a", encoding="utf-8").close()
+        except Exception as e:
+            logger.error(f"Erro ao carregar whitelist: {e}")
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admins
+
+    def is_authorized(self, user_id: int) -> bool:
+        return user_id in self.whitelist or self.is_admin(user_id)
 
 # ======================================
 # Bloco 3 — SecurityManager & DataFetcher
@@ -1994,32 +1843,33 @@ class BotLotofacil:
 bot = BotLotofacil()
 
 def apenas_admin(func):
-    def wrapper(update, context):
+    async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
         try:
-            if not bot.security.is_admin(update.effective_user.id):
-                update.message.reply_text("❌ Comando restrito ao administrador.")
+            if not context.bot.security.is_admin(update.effective_user.id):
+                await update.message.reply_text("❌ Comando restrito ao administrador.")
                 return
-            return func(update, context)
+            return await func(update, context, *args, **kwargs)
         except Exception as e:
             logger.error(f"Erro inesperado em comando admin: {str(e)}")
-            update.message.reply_text("❌ Erro interno. Tente novamente mais tarde.")
+            await update.message.reply_text("❌ Erro interno. Tente novamente mais tarde.")
     return wrapper
 
 def somente_autorizado(func):
-    def wrapper(update, context):
+    async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
         try:
-            if not bot.security.is_authorized(update.effective_user.id):
-                update.message.reply_text("❌ Você não tem permissão para usar este bot.")
+            if not context.bot.security.is_authorized(update.effective_user.id):
+                await update.message.reply_text("❌ Você não tem permissão para usar este bot.")
                 return
-            return func(update, context)
+            return await func(update, context, *args, **kwargs)
         except Exception as e:
             logger.error(f"Erro inesperado: {str(e)}")
-            update.message.reply_text("❌ Ocorreu um erro inesperado. Tente novamente.")
+            await update.message.reply_text("❌ Ocorreu um erro inesperado. Tente novamente.")
     return wrapper
 
-def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text(AVISO_LEGAL, parse_mode='HTML')
-    update.message.reply_text(
+@somente_autorizado
+async def start(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text(AVISO_LEGAL, parse_mode='HTML')
+    await update.message.reply_text(
         "🎰 Bot da Lotofácil IA 🎰\n\n"
         "Comandos disponíveis:\n"
         "/meuid - Mostra seu ID do Telegram\n"
@@ -2032,106 +1882,109 @@ def start(update: Update, context: CallbackContext) -> None:
     )
 
 @somente_autorizado
-def comando_aposta(update: Update, context: CallbackContext) -> None:
-    if not rate_limit(update, "aposta"):
+async def comando_aposta(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "aposta"):
         return
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    
-    # Verifica se o bot está pronto
-    if not bot.is_ready(timeout=5):
-        update.message.reply_text("⚠️ O bot ainda está inicializando. Por favor, aguarde...")
+
+    if not context.bot.is_ready(timeout=5):
+        await update.message.reply_text("⚠️ O bot ainda está inicializando. Por favor, aguarde...")
         return
 
+    progress_msg = None
+    progress_job = None
+
     try:
-        # Configura timeout
+        # Configura timeout (apenas em sistemas Unix)
         signal.alarm(15)
 
-        # 1. Configuração inicial
         n_apostas = int(context.args[0]) if context.args and context.args[0].isdigit() else 5
         n_apostas = max(1, min(n_apostas, 10))
 
-        # 2. Verificação de cache
-        cached = bot.get_cached_apostas(user_id, n_apostas)
+        cached = context.bot.get_cached_apostas(user_id, n_apostas)
         if cached:
             logger.info(f"Cache hit para {user_id} ({n_apostas} apostas)")
-            return enviar_apostas(context, chat_id, cached, "cache")
+            await enviar_apostas(context, chat_id, cached, "cache")
+            return
 
-        # 3. Barra de progresso
-        progress_msg, progress_job = _start_progress(context, chat_id)
+        progress_msg, progress_job = await _start_progress(context, chat_id)
 
-        # 4. Geração de apostas
-        apostas = bot.gerar_apostas_paralelo(n_apostas)
+        apostas = context.bot.gerar_apostas_paralelo(n_apostas)
         engine_label = "paralelo"
 
-        # 5. Cache e envio
-        bot.set_cached_apostas(user_id, apostas)
-        enviar_apostas(context, chat_id, apostas, engine_label)
+        context.bot.set_cached_apostas(user_id, apostas)
+        await enviar_apostas(context, chat_id, apostas, engine_label)
 
     except TimeoutError:
         logger.warning(f"Timeout gerando apostas para {user_id}")
-        safe_send_message(context, chat_id, "⏱️ Operação excedeu o tempo limite. Tente novamente.")
-        
+        await safe_send_message(context, chat_id, "⏱️ Operação excedeu o tempo limite. Tente novamente.")
+
     except Exception as e:
         logger.error(f"Erro em comando_aposta: {str(e)}", exc_info=True)
-        safe_send_message(context, chat_id, "⚠️ Falha crítica. Contate o administrador.")
-        
+        await safe_send_message(context, chat_id, "⚠️ Falha crítica. Contate o administrador.")
+
     finally:
         signal.alarm(0)
         if progress_job:
             with contextlib.suppress(Exception):
                 progress_job.schedule_removal()
         if progress_msg:
-            _stop_progress(progress_job, progress_msg, "✅ Finalizado")
+            await _stop_progress(progress_job, progress_msg, "✅ Finalizado")
             
-def enviar_apostas(context: CallbackContext, chat_id: int, apostas: List[List[int]], fonte: str) -> None:
-    """Função auxiliar para envio padronizado"""
+async def enviar_apostas(context: CallbackContext, chat_id: int, apostas: List[List[int]], fonte: str) -> None:
+    """Função auxiliar para envio padronizado."""
     mensagem = f"🎲 Apostas ({fonte}) 🎲\n\n"
     for i, aposta in enumerate(apostas, 1):
         pares = sum(1 for n in aposta if n % 2 == 0)
         mensagem += (
             f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
-            f"Pares: {pares} | Ímpares: {15-pares}\n\n"
+            f"Pares: {pares} | Ímpares: {15 - pares}\n\n"
         )
-    safe_send_message(context, chat_id, mensagem)
-            
+    await safe_send_message(context, chat_id, mensagem)
+
 @somente_autorizado
-def comando_tendencia(update: Update, context: CallbackContext) -> None:
-    if not rate_limit(update, "tendencia"):
+async def comando_tendencia(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "tendencia"):
         return
-    if bot.dados is None or len(bot.dados) == 0:
-        update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
+
+    if context.bot.dados is None or len(context.bot.dados) == 0:
+        await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
         logger.error("Dados indisponíveis ao tentar gerar aposta de tendência.")
         return
+
     try:
-        aposta = bot.gerar_aposta_tendencia()
+        aposta = context.bot.gerar_aposta_tendencia()
         pares = sum(1 for n in aposta if n % 2 == 0)
         soma = sum(aposta)
         mensagem = (
             "📈 <b>Aposta Baseada em Tendências</b>\n\n"
             f"<b>Números:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
-            f"Pares: {pares} | Ímpares: {15-pares} | Soma: {soma}\n\n"
+            f"Pares: {pares} | Ímpares: {15 - pares} | Soma: {soma}\n\n"
             "<i>Estratégia: Combina números quentes (últimos sorteios) e frios (ausentes)</i>"
         )
-        update.message.reply_text(mensagem, parse_mode='HTML')
+        await update.message.reply_text(mensagem, parse_mode='HTML')
+
     except Exception as e:
         logger.error(f"Erro ao gerar aposta de tendência: {str(e)}")
-        update.message.reply_text("❌ Ocorreu um erro ao gerar a aposta. Tente novamente.")
+        await update.message.reply_text("❌ Ocorreu um erro ao gerar a aposta. Tente novamente.")
 
 @somente_autorizado
-def comando_analise(update: Update, context: CallbackContext) -> None:
-    if not rate_limit(update, "analise"):
+async def comando_analise(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "analise"):
         return
-    if bot.dados is None or len(bot.dados) == 0:
-        update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
+
+    if context.bot.dados is None or len(context.bot.dados) == 0:
+        await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
         logger.error("Dados indisponíveis ao tentar gerar análise estatística.")
         return
-    try:
-        grafico = bot.gerar_grafico_frequencia()
-        update.message.reply_photo(photo=InputFile(grafico), caption='Frequência dos números na Lotofácil')
 
-        freq_completa = [(n, bot.frequencias.get(n, 0)) for n in range(1, 26)]
+    try:
+        grafico = context.bot.gerar_grafico_frequencia()
+        await update.message.reply_photo(photo=InputFile(grafico), caption='Frequência dos números na Lotofácil')
+
+        freq_completa = [(n, context.bot.frequencias.get(n, 0)) for n in range(1, 26)]
         freq_ordenada = sorted(freq_completa, key=lambda x: (x[1], x[0]))
         menos_frequentes = [str(n) for n, _ in freq_ordenada[:5]]
         mais_frequentes = [str(n) for n, _ in sorted(freq_completa, key=lambda x: (-x[1], x[0]))[:5]]
@@ -2142,36 +1995,41 @@ def comando_analise(update: Update, context: CallbackContext) -> None:
             f"<b>Números menos frequentes:</b> {', '.join(menos_frequentes)}\n\n"
             "<b>Clusters identificados:</b>\n"
         )
-        for cluster, nums in bot.clusters.items():
+        for cluster, nums in context.bot.clusters.items():
             mensagem += f"Cluster {cluster}: {', '.join(str(n) for n in sorted(nums))}\n"
-        update.message.reply_text(mensagem, parse_mode='HTML')
+
+        await update.message.reply_text(mensagem, parse_mode='HTML')
+
     except Exception as e:
         logger.error(f"Erro ao gerar análise: {str(e)}")
-        update.message.reply_text("❌ Ocorreu um erro ao gerar a análise. Tente novamente.")
+        await update.message.reply_text("❌ Ocorreu um erro ao gerar a análise. Tente novamente.")
 
 @apenas_admin
-def comando_atualizar(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("🔄 Atualizando dados... Isso pode demorar alguns minutos.")
+async def comando_atualizar(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text("🔄 Atualizando dados... Isso pode demorar alguns minutos.")
+
     try:
-        bot.dados = bot.carregar_dados(atualizar=True)
-        if bot.dados is None or len(bot.dados) == 0:
-            update.message.reply_text("❌ Falha ao atualizar dados. Nenhum dado foi carregado.")
+        context.bot.dados = context.bot.carregar_dados(atualizar=True)
+        if context.bot.dados is None or len(context.bot.dados) == 0:
+            await update.message.reply_text("❌ Falha ao atualizar dados. Nenhum dado foi carregado.")
             logger.error("Falha ao atualizar dados: Nenhum dado foi carregado.")
             return
 
-        bot.analisar_dados()
-        bot.modelo = bot.construir_modelo()
+        context.bot.analisar_dados()
+        context.bot.modelo = context.bot.construir_modelo()
 
         try:
-            bot._teste_engine_precisa_startup()
-            bot.precise_enabled = True
-            bot.precise_fail_count = 0
-            bot.precise_last_error = None
-            update.message.reply_text("✅ Dados e modelo atualizados com sucesso! Engine precisa revalidado e ATIVO.")
+            context.bot._teste_engine_precisa_startup()
+            context.bot.precise_enabled = True
+            context.bot.precise_fail_count = 0
+            context.bot.precise_last_error = None
+
+            await update.message.reply_text("✅ Dados e modelo atualizados com sucesso! Engine precisa revalidado e ATIVO.")
         except Exception as e:
-            bot.precise_enabled = False
-            bot.precise_last_error = str(e)
-            update.message.reply_text(
+            context.bot.precise_enabled = False
+            context.bot.precise_last_error = str(e)
+
+            await update.message.reply_text(
                 "✅ Dados e modelo atualizados.\n"
                 f"⚠️ Engine precisa desativado após reteste: {e}"
             )
@@ -2179,21 +2037,25 @@ def comando_atualizar(update: Update, context: CallbackContext) -> None:
 
     except Exception as e:
         logger.error(f"Erro ao atualizar dados: {str(e)}")
-        update.message.reply_text("❌ Falha ao atualizar dados. Verifique os logs.")
+        await update.message.reply_text("❌ Falha ao atualizar dados. Verifique os logs.")
+
 
 @somente_autorizado
-def comando_status(update: Update, context: CallbackContext) -> None:
-    if not rate_limit(update, "status"):
+async def comando_status(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "status"):
         return
 
     try:
-        if bot.dados is None or len(bot.dados) == 0:
-            update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
+        bot = context.bot
+
+        if not hasattr(bot, "dados") or bot.dados is None or len(bot.dados) == 0:
+            await update.message.reply_text("❌ Dados indisponíveis. Use /atualizar ou aguarde atualização dos dados.")
             logger.error("Dados indisponíveis ao tentar verificar status do sistema.")
             return
 
-        ultimo = bot.dados.loc[bot.dados['data'].idxmax()]
-        total_concursos = len(bot.dados)
+        dados = bot.dados
+        ultimo = dados.loc[dados['data'].idxmax()]
+        total_concursos = len(dados)
 
         engine_status = (
             "✅ Ativa"
@@ -2234,63 +2096,57 @@ def comando_status(update: Update, context: CallbackContext) -> None:
 
         status += f"\n<b>Última aposta gerada:</b> {ultima_aposta}"
 
-        update.message.reply_text(status, parse_mode='HTML')
+        await update.message.reply_text(status, parse_mode='HTML')
 
     except Exception as e:
         logger.error(f"Erro ao verificar status: {str(e)}")
-        update.message.reply_text("❌ Ocorreu um erro ao verificar o status. Tente novamente.")
-
+        await update.message.reply_text("❌ Ocorreu um erro ao verificar o status. Tente novamente.")
 
 @apenas_admin
-def comando_inserir(update, context):
-    if not rate_limit(update, "inserir"):
+async def comando_inserir(update: Update, context: CallbackContext) -> None:
+    if not await rate_limit(update, "inserir"):
         return
-    
+
     try:
-        # 1. VALIDAÇÃO BÁSICA DOS ARGUMENTOS
         if not context.args or len(context.args) != 16:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "❌ Uso correto: /inserir YYYY-MM-DD D1 D2 ... D15\n"
                 "Exemplo: /inserir 2025-08-08 01 03 05 07 09 10 12 14 17 18 19 20 22 23 25"
             )
             return
 
-        # Processa argumentos
         data = context.args[0]
         dezenas = context.args[1:]
-        
+
         try:
             dezenas_int = [int(d) for d in dezenas]
         except Exception:
-            update.message.reply_text("❌ Todas as dezenas devem ser números inteiros entre 1 e 25.")
+            await update.message.reply_text("❌ Todas as dezenas devem ser números inteiros entre 1 e 25.")
             return
-            
+
         if len(dezenas_int) != 15 or any(not 1 <= d <= 25 for d in dezenas_int):
-            update.message.reply_text("❌ Dados inválidos. Verifique os números (apenas 15 dezenas, de 1 a 25).")
+            await update.message.reply_text("❌ Dados inválidos. Verifique os números (apenas 15 dezenas, de 1 a 25).")
             return
-            
+
         try:
             data_dt = pd.to_datetime(data, format="%Y-%m-%d", errors="raise")
         except Exception:
-            update.message.reply_text("❌ Data inválida. Utilize o formato YYYY-MM-DD.")
+            await update.message.reply_text("❌ Data inválida. Utilize o formato YYYY-MM-DD.")
             return
 
-        # 2. CONFIGURAÇÕES DE ARQUIVO
         csv_path = 'lotofacil_historico.csv'
         caminho_absoluto = os.path.abspath(csv_path)
         logger.info(f"Iniciando inserção no arquivo: {caminho_absoluto}")
-        
+
         if not os.path.exists(csv_path):
-            update.message.reply_text("❌ Arquivo lotofacil_historico.csv não encontrado no servidor.")
+            await update.message.reply_text("❌ Arquivo lotofacil_historico.csv não encontrado no servidor.")
             logger.error(f"Arquivo não encontrado: {caminho_absoluto}")
             return
 
-        # 3. VERIFICAÇÃO DE PERMISSÕES
         if not verificar_e_corrigir_permissoes_arquivo(csv_path):
-            update.message.reply_text("❌ Problema com permissões do arquivo CSV.")
+            await update.message.reply_text("❌ Problema com permissões do arquivo CSV.")
             return
 
-        # 4. BACKUP ANTES DE MODIFICAR
         try:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             backup_path = f"backups/lotofacil_pre_insercao_{timestamp}.csv"
@@ -2299,22 +2155,19 @@ def comando_inserir(update, context):
             logger.info(f"Backup criado com sucesso: {backup_path}")
         except Exception as e:
             logger.error(f"Falha no backup: {str(e)}")
-            update.message.reply_text("⚠️ AVISO: Não foi possível criar backup antes da inserção.")
+            await update.message.reply_text("⚠️ AVISO: Não foi possível criar backup antes da inserção.")
 
-        # 5. CARREGAMENTO E VALIDAÇÃO DOS DADOS EXISTENTES
         df = pd.read_csv(csv_path)
         logger.info(f"Dados carregados. Shape atual: {df.shape}")
 
-        # Validação de duplicidade de data
         if 'data' in df.columns and not df.empty:
             df_datas = pd.to_datetime(df['data'], format="%Y-%m-%d", errors="coerce")
             if df_datas.isna().any():
                 df_datas = pd.to_datetime(df['data'], dayfirst=True, errors="coerce")
             if (df_datas.dt.date == data_dt.date()).any():
-                update.message.reply_text("⚠️ Já existe um concurso com esta data no histórico.")
+                await update.message.reply_text("⚠️ Já existe um concurso com esta data no histórico.")
                 return
 
-        # Validação de combinação de dezenas duplicada
         if not df.empty:
             alvo = frozenset(dezenas_int)
             cols_b = [f'B{i}' for i in range(1, 16) if f'B{i}' in df.columns]
@@ -2322,29 +2175,25 @@ def comando_inserir(update, context):
                 for _, row in df[cols_b].iterrows():
                     s = frozenset(int(row[f'B{i}']) for i in range(1, 16))
                     if s == alvo:
-                        update.message.reply_text("⚠️ Já existe um concurso com exatamente as mesmas 15 dezenas.")
+                        await update.message.reply_text("⚠️ Já existe um concurso com exatamente as mesmas 15 dezenas.")
                         return
 
-        # 6. PREPARAÇÃO DA NOVA LINHA
         proximo_numero = int(df['numero'].max()) + 1 if 'numero' in df.columns and not df.empty else 1
-        
+
         nova_linha = {'numero': proximo_numero, 'data': data}
         for i, dez in enumerate(dezenas_int, 1):
             nova_linha[f'B{i}'] = dez
         for i in range(1, 6):
             nova_linha[f'repetidos_{i}'] = 0
 
-        # 7.1 VERIFICAÇÃO PRÉ-SALVAMENTO
         try:
             novo_df = pd.concat([df, pd.DataFrame([nova_linha])], ignore_index=True)
-            
-            # Verificação de sequência numérica
+
             if 'numero' in novo_df.columns:
                 nums = novo_df['numero'].values
                 if any(nums[i] >= nums[i+1] for i in range(len(nums)-1)):
                     raise ValueError("Números de concurso não sequenciais após inserção")
-                    
-            # Verificação das dezenas
+
             for i in range(1, 16):
                 col = f'B{i}'
                 if any(not 1 <= num <= 25 for num in novo_df[col].dropna()):
@@ -2352,69 +2201,60 @@ def comando_inserir(update, context):
 
         except Exception as e:
             logger.error(f"Falha na verificação pré-salvamento: {str(e)}")
-            update.message.reply_text("❌ Falha na verificação dos dados antes de salvar.")
+            await update.message.reply_text("❌ Falha na verificação dos dados antes de salvar.")
             return
 
-        # 7.2 SALVAMENTO ROBUSTO EM 3 ETAPAS
         try:
-            # Etapa 1: Salvar para arquivo temporário
             temp_path = f"{csv_path}.tmp"
             novo_df.to_csv(temp_path, index=False)
-            
-            # Etapa 2: Verificar arquivo temporário
+
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                 raise RuntimeError("Arquivo temporário não criado corretamente")
-            
-            # Etapa 3: Substituição atômica
+
             os.replace(temp_path, csv_path)
-            
-            # Verificação final
+
             if not os.path.exists(csv_path):
                 raise RuntimeError("Arquivo principal não existe após substituição")
-                
+
             logger.info(f"CSV salvo com sucesso. Tamanho: {os.path.getsize(csv_path)} bytes")
 
         except Exception as e:
             logger.critical(f"FALHA NO SALVAMENTO: {str(e)}")
-            # Tenta recuperar do backup
             if os.path.exists(backup_path):
                 try:
                     shutil.copy2(backup_path, csv_path)
                     logger.info("Dados restaurados a partir do backup")
                 except Exception as restore_error:
                     logger.critical(f"FALHA NA RECUPERAÇÃO: {str(restore_error)}")
-            
-            update.message.reply_text(
+
+            await update.message.reply_text(
                 "❌ FALHA CRÍTICA: Não foi possível salvar os dados.\n"
                 "Os administradores foram notificados."
             )
             return
 
-        # 8. RECARREGAMENTO E VERIFICAÇÃO
         try:
             bot.dados = bot.carregar_dados(atualizar=True, force_csv=True)
             if bot.dados is None:
                 raise RuntimeError("Falha ao recarregar dados")
-                
-            # Verificação robusta do recarregamento
+
             ultimo_numero = bot.dados['numero'].iloc[-1]
             ultimas_dezenas = set(bot.dados.iloc[-1][[f'B{i}' for i in range(1,16)]])
-            
+
             if ultimo_numero != proximo_numero:
                 raise RuntimeError(f"Discrepância no número do concurso (esperado: {proximo_numero}, obtido: {ultimo_numero})")
-                
+
             if ultimas_dezenas != set(dezenas_int):
                 raise RuntimeError("Discrepância nas dezenas do último concurso")
-                
+
         except Exception as e:
             logger.critical(f"FALHA NO RECARREGAMENTO: {str(e)}")
-            update.message.reply_text(
+            await update.message.reply_text(
                 "⚠️ AVISO: Dados inseridos mas falha ao recarregar.\n"
                 "O sistema pode precisar de reinicialização."
             )
 
-        # 9. MENSAGEM DE SUCESSO COM CONFIRMAÇÃO
-        update.message.reply_text(
+        await update.message.reply_text(
             f"✅ Resultado inserido e VERIFICADO com sucesso!\n"
             f"Concurso: {proximo_numero}\n"
             f"Data: {data}\n"
@@ -2426,53 +2266,45 @@ def comando_inserir(update, context):
 
     except Exception as e:
         logger.critical(f"ERRO GRAVE em comando_inserir: {str(e)}", exc_info=True)
-        update.message.reply_text(
+        await update.message.reply_text(
             "❌ ERRO CRÍTICO: Falha no processo de inserção.\n"
             "Detalhes foram registrados nos logs."
         )
-        
-def comando_meuid(update: Update, context: CallbackContext) -> None:
-    user_id = update.effective_user.id
-    update.message.reply_text(
-        f"Seu ID do Telegram é: <b>{user_id}</b>\n\n"
-        "Seu ID será utilizado apenas para controle de acesso ao bot. Nenhuma outra informação pessoal é salva ou compartilhada.\n"
-        "Envie este número para o administrador do bot para solicitar acesso.",
-        parse_mode='HTML'
-    )
 
+        
 @apenas_admin
-def comando_autorizar(update: Update, context: CallbackContext) -> None:
+async def comando_autorizar(update: Update, context: CallbackContext) -> None:
     try:
         if not context.args or not context.args[0].isdigit():
-            update.message.reply_text("❌ Uso correto: /autorizar <ID_do_usuário>")
+            await update.message.reply_text("❌ Uso correto: /autorizar <ID_do_usuário>")
             return
         user_id = int(context.args[0])
         whitelist_path = "whitelist.txt"
         bot.security.load_whitelist(whitelist_path)
         if user_id in bot.security.whitelist or user_id in bot.security.admins:
-            update.message.reply_text(f"✅ O ID {user_id} já está autorizado.")
+            await update.message.reply_text(f"✅ O ID {user_id} já está autorizado.")
             return
         with open(whitelist_path, "a") as f:
             f.write(f"{user_id}\n")
         bot.security.whitelist.add(user_id)
-        update.message.reply_text(f"✅ Usuário {user_id} autorizado com sucesso.")
-        # envia o manual automaticamente
-        context.bot.send_message(chat_id=user_id, text=MANUAL_USUARIO, parse_mode='HTML')
+        await update.message.reply_text(f"✅ Usuário {user_id} autorizado com sucesso.")
+        await context.bot.send_message(chat_id=user_id, text=MANUAL_USUARIO, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Erro ao autorizar usuário: {str(e)}")
-        update.message.reply_text("❌ Erro ao autorizar usuário.")
+        await update.message.reply_text("❌ Erro ao autorizar usuário.")
+
 
 @apenas_admin
-def comando_remover(update: Update, context: CallbackContext) -> None:
+async def comando_remover(update: Update, context: CallbackContext) -> None:
     try:
         if not context.args or not context.args[0].isdigit():
-            update.message.reply_text("❌ Uso correto: /remover <ID_do_usuário>")
+            await update.message.reply_text("❌ Uso correto: /remover <ID_do_usuário>")
             return
         user_id = int(context.args[0])
         whitelist_path = "whitelist.txt"
         bot.security.load_whitelist(whitelist_path)
         if user_id not in bot.security.whitelist:
-            update.message.reply_text(f"ℹ️ O ID {user_id} não está na whitelist.")
+            await update.message.reply_text(f"ℹ️ O ID {user_id} não está na whitelist.")
             return
         with open(whitelist_path, "r") as f:
             linhas = f.readlines()
@@ -2481,12 +2313,22 @@ def comando_remover(update: Update, context: CallbackContext) -> None:
                 if linha.strip() != str(user_id):
                     f.write(linha)
         bot.security.whitelist.discard(user_id)
-        update.message.reply_text(f"✅ Usuário {user_id} removido da whitelist.")
+        await update.message.reply_text(f"✅ Usuário {user_id} removido da whitelist.")
     except Exception as e:
         logger.error(f"Erro ao remover usuário: {str(e)}")
-        update.message.reply_text("❌ Erro ao remover usuário.")
+        await update.message.reply_text("❌ Erro ao remover usuário.")
+
+async def comando_meuid(update: Update, context: CallbackContext) -> None:
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        f"Seu ID do Telegram é: <b>{user_id}</b>\n\n"
+        "Seu ID será utilizado apenas para controle de acesso ao bot. Nenhuma outra informação pessoal é salva ou compartilhada.\n"
+        "Envie este número para o administrador do bot para solicitar acesso.",
+        parse_mode='HTML'
+    )
+
         
-def error_handler(update: Update, context: CallbackContext) -> None:
+async def error_handler(update: Update, context: CallbackContext) -> None:
     """Tratamento robusto de erros, incluindo timeouts."""
     error = context.error
     logger.error(f"Erro no bot: {str(error)}", exc_info=True)
@@ -2494,9 +2336,9 @@ def error_handler(update: Update, context: CallbackContext) -> None:
     try:
         if isinstance(error, telegram.error.TimedOut):
             if update and update.message:
-                safe_send_message(
+                await safe_send_message(
                     context,
-                    update.message.chat_id,
+                    update.effective_chat.id,
                     "⌛ O sistema está ocupado. Tentando novamente...",
                     timeout=20
                 )
@@ -2504,24 +2346,30 @@ def error_handler(update: Update, context: CallbackContext) -> None:
         elif isinstance(error, telegram.error.NetworkError):
             logger.error("Problema de conexão com a API do Telegram")
             if update and update.message:
-                safe_send_message(
+                await safe_send_message(
                     context,
-                    update.message.chat_id,
+                    update.effective_chat.id,
                     "⚠️ Problema temporário de conexão. Por favor, tente novamente em alguns instantes."
                 )
 
         else:
             if update and update.message:
-                safe_send_message(
+                await safe_send_message(
                     context,
-                    update.message.chat_id,
+                    update.effective_chat.id,
                     "❌ Ocorreu um erro inesperado. Os administradores foram notificados."
                 )
 
     except Exception as inner_error:
         logger.error(f"Erro no handler de erros: {str(inner_error)}", exc_info=True)
-            
-def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwargs) -> None:
+
+
+async def safe_send_message(
+    context: CallbackContext,
+    chat_id: int,
+    text: str,
+    **kwargs
+) -> None:
     """Envio seguro de mensagens com tratamento de timeout e retry."""
     max_retries = 3
     base_timeout = 10
@@ -2529,7 +2377,7 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
 
     for attempt in range(max_retries):
         try:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode=parse_mode,
@@ -2546,14 +2394,16 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, **kwarg
             logger.warning(f"Problema de rede ao enviar mensagem (tentativa {attempt + 1}): {str(e)}")
             if attempt == max_retries - 1:
                 raise
-            time.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt)
         except Exception as e:
             logger.error(f"Erro inesperado ao enviar mensagem: {str(e)}")
             raise
 
-def main() -> None:
-    """Função principal do bot com monitoramento de recursos completo e inicialização segura."""
-    # Configuração inicial segura
+
+async def main() -> None:
+    """Função principal do bot com inicialização assíncrona e monitoramento seguro."""
+
+    # 1. CONFIGURAÇÃO INICIAL
     try:
         os.makedirs("backups", exist_ok=True)
         os.makedirs("cache", exist_ok=True)
@@ -2572,173 +2422,70 @@ def main() -> None:
         logger.critical(f"Falha na configuração inicial: {str(e)}")
         sys.exit(1)
 
+    # 2. CONSTRUÇÃO DA APLICAÇÃO
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TOKEN:
+        logger.critical("TOKEN do Telegram não encontrado na variável de ambiente TELEGRAM_BOT_TOKEN")
+        sys.exit(1)
+
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # 3. INICIALIZAÇÃO DO BOT (global)
+    global bot
+    bot = BotLotofacil()
+
     try:
-        # Configura timeout generoso para inicialização (5 minutos)
-        signal.alarm(300)
-
-        # Inicializa o bot de forma assíncrona
-        global bot
-        bot = BotLotofacil()
-
-        # Aguarda inicialização completa com timeout de 4 minutos
-        if not bot.is_ready(timeout=240):
-            logger.critical("Timeout na inicialização do bot (excedeu 4 minutos)")
-            sys.exit(1)
-
-        # Configura o updater do Telegram
-        updater = None
-        try:
-            updater = Updater(
-                token=TOKEN,
-                use_context=True,
-                request_kwargs=REQUEST_KWARGS,
-                workers=4
-            )
-            dp = updater.dispatcher
-        except Exception as e:
-            logger.critical(f"Falha na inicialização do Updater: {str(e)}")
-            raise
-
-        # Configuração do monitoramento de recursos
-        jq = updater.job_queue if updater else None
-        if jq:
-            try:
-                jq.run_repeating(
-                    callback=ResourceMonitor.log_resource_usage,
-                    interval=1800,
-                    first=10
-                )
-                jq.run_once(
-                    lambda ctx: logger.info("✅ Teste inicial do monitoramento concluído com sucesso"),
-                    when=5
-                )
-                logger.info("Monitoramento de recursos ativado (intervalo: 30 minutos)")
-            except Exception as e:
-                logger.error(f"Falha ao configurar monitoramento: {str(e)}")
-        else:
-            logger.warning("JobQueue indisponível - monitoramento de recursos desativado")
-
-        # Verificação inicial de saúde do sistema
-        try:
-            stats = ResourceMonitor.get_system_stats()
-            if stats:
-                alerta = ""
-                if stats['mem_percent'] > _MAX_MEMORY_ALERT:
-                    alerta = f" ⚠️ Memória alta: {stats['mem_percent']:.1f}%"
-                if stats['disk_percent'] > 90:
-                    alerta += f" ⚠️ Disco quase cheio: {stats['disk_percent']:.1f}%"
-                logger.info(f"Teste de saúde OK - Memória: {stats['mem_percent']:.1f}%{alerta}")
-            else:
-                logger.warning("Coleta inicial de recursos retornou vazia")
-        except Exception as e:
-            logger.error(f"Falha no teste inicial do monitoramento: {str(e)}")
-
-        # Registro dos handlers de comandos
-        handlers = [
-            CommandHandler("start", start),
-            CommandHandler("meuid", comando_meuid),
-            CommandHandler("aposta", comando_aposta),
-            CommandHandler("tendencia", comando_tendencia),
-            CommandHandler("analise", comando_analise),
-            CommandHandler("atualizar", comando_atualizar),
-            CommandHandler("inserir", comando_inserir),
-            CommandHandler("status", comando_status),
-            CommandHandler("autorizar", comando_autorizar),
-            CommandHandler("remover", comando_remover)
-        ]
-        for handler in handlers:
-            try:
-                dp.add_handler(handler)
-            except Exception as e:
-                logger.error(f"Falha ao registrar handler {handler.callback.__name__}: {str(e)}")
-
-        dp.add_error_handler(error_handler)
-
-        # Verificação final do estado do bot
-        if not hasattr(bot, 'ultima_geracao_precisa'):
-            bot.ultima_geracao_precisa = []
-        if not hasattr(bot, 'engine_precisa_ativa'):
-            bot.engine_precisa_ativa = False
-            bot.engine_precisa_falhas = 0
-            bot.engine_precisa_erro = "Atributo não inicializado"
-
-        logger.info(
-            f"✅ Bot inicializado com sucesso\n"
-            f"• Engine precisa: {'ATIVA' if bot.engine_precisa_ativa else 'INATIVA'}\n"
-            f"• Monitoramento: {'ATIVO' if jq else 'INATIVO'}\n"
-            f"• Workers: {updater.dispatcher.workers}\n"
-            f"• Timeouts: {REQUEST_KWARGS['connect_timeout']}s connect, {REQUEST_KWARGS['read_timeout']}s read"
-        )
-
-        # Desativa o alarme após inicialização bem-sucedida
-        signal.alarm(0)
-
-        # Inicia o polling
-        try:
-            updater.start_polling(
-                poll_interval=0.5,
-                timeout=15,
-                drop_pending_updates=True,
-                bootstrap_retries=3
-            )
-            updater.idle()
-        except Exception as e:
-            logger.critical(f"Falha no start_polling: {str(e)}")
-            raise
-
-    except telegram.error.NetworkError as e:
-        logger.critical(f"ERRO DE REDE: {str(e)}")
+        await asyncio.wait_for(bot.aguardar_pronto(), timeout=240)
+    except asyncio.TimeoutError:
+        logger.critical("Timeout: Bot não ficou pronto em 4 minutos.")
         sys.exit(1)
-    except telegram.error.InvalidToken:
-        logger.critical("TOKEN INVÁLIDO - Verifique a variável de ambiente TOKEN")
-        sys.exit(1)
-    except telegram.error.TelegramError as e:
-        logger.critical(f"ERRO DO TELEGRAM: {str(e)}")
-        sys.exit(1)
-    except TimeoutError:
-        logger.critical("Timeout na inicialização do bot (excedeu o tempo limite)")
-        sys.exit(1)
+
+    # 4. MONITORAMENTO DE RECURSOS
+    try:
+        job_queue = application.job_queue
+        job_queue.run_repeating(ResourceMonitor.log_resource_usage, interval=1800, first=10)
+        logger.info("Monitoramento de recursos ativado (intervalo: 30 minutos)")
     except Exception as e:
-        logger.critical(
-            f"ERRO INESPERADO: {str(e)}\n"
-            f"Tipo: {type(e).__name__}\n"
-            f"Traceback: {traceback.format_exc()}",
-            exc_info=True
-        )
-        sys.exit(1)
-    finally:
-        logger.info("Encerrando processo do bot...")
-        signal.alarm(0)
+        logger.warning(f"Falha ao iniciar monitoramento de recursos: {e}")
 
-        try:
-            if 'updater' in locals() and updater:
-                updater.stop()
-                updater.is_idle = False
-                logger.info("Updater parado com sucesso")
-        except Exception as e:
-            logger.error(f"Erro ao parar updater: {str(e)}")
+    # 5. HANDLERS
+    application.add_handlers([
+        CommandHandler("start", start),
+        CommandHandler("meuid", comando_meuid),
+        CommandHandler("aposta", comando_aposta),
+        CommandHandler("tendencia", comando_tendencia),
+        CommandHandler("analise", comando_analise),
+        CommandHandler("atualizar", comando_atualizar),
+        CommandHandler("inserir", comando_inserir),
+        CommandHandler("status", comando_status),
+        CommandHandler("autorizar", comando_autorizar),
+        CommandHandler("remover", comando_remover),
+    ])
 
-        try:
-            if 'bot' in globals():
-                if hasattr(bot, 'modelo'):
-                    del bot.modelo
-                    logger.info("Modelo TensorFlow liberado da memória")
-            gc.collect()
-        except Exception as e:
-            logger.error(f"Erro na limpeza de recursos: {str(e)}")
+    application.add_error_handler(error_handler)
+
+    # 6. CONFIGURAÇÕES FINAIS DO BOT
+    if not hasattr(bot, 'ultima_geracao_precisa'):
+        bot.ultima_geracao_precisa = []
+    if not hasattr(bot, 'engine_precisa_ativa'):
+        bot.engine_precisa_ativa = False
+        bot.engine_precisa_falhas = 0
+        bot.engine_precisa_erro = "Atributo não inicializado"
+
+    logger.info("✅ Bot inicializado com sucesso no modo assíncrono (PTB v20+)")
+
+    # 7. EXECUÇÃO
+    await application.run_polling(
+        poll_interval=1.0,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 if __name__ == '__main__':
-    # Token do bot
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Encerrando o bot por interrupção manual...")
 
-    # Construção da aplicação (PTB v20+)
-    application = Application.builder().token(TOKEN).build()
-
-    # Registro do handler para o comando /aposta
-    application.add_handler(CommandHandler("aposta", handler_aposta))
-
-    # Execução do bot
-    application.run_polling()
 
 
 
