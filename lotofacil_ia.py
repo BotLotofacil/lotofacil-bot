@@ -2464,15 +2464,19 @@ async def main() -> None:
 
     application = ApplicationBuilder().token(TOKEN).build()
 
-
     # 3. INICIALIZAÇÃO DO BOT (global)
     global bot
     bot = BotLotofacil()
 
+    # Aguarda a inicialização em thread sem bloquear o event loop
     try:
-        await asyncio.wait_for(bot.aguardar_pronto(), timeout=240)
-    except asyncio.TimeoutError:
-        logger.critical("Timeout: Bot não ficou pronto em 4 minutos.")
+        ready = await asyncio.to_thread(bot.is_ready, 240)  # timeout em segundos
+    except Exception as e:
+        logger.critical(f"Falha ao aguardar inicialização do bot: {e}")
+        sys.exit(1)
+
+    if not ready:
+        logger.critical("Timeout: Bot não ficou pronto em 4 minutos ou falhou na inicialização.")
         sys.exit(1)
 
     # 4. MONITORAMENTO DE RECURSOS
@@ -2520,6 +2524,8 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Encerrando o bot por interrupção manual...")
+
+
 
 
 
